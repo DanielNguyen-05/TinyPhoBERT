@@ -34,9 +34,9 @@ FIGSIZE = (12, 6)
 
 # %%
 # Load data
-train_df = pd.read_csv("../data/processed/train.csv")
-val_df = pd.read_csv("../data/processed/val.csv")
-test_df = pd.read_csv("../data/processed/test.csv")
+train_df = pd.read_csv("./data/processed/train.csv")
+val_df = pd.read_csv("./data/processed/val.csv")
+test_df = pd.read_csv("./data/processed/test.csv")
 full_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
 
 print(f"Train: {len(train_df):,} | Val: {len(val_df):,} | Test: {len(test_df):,}")
@@ -63,7 +63,7 @@ for i, (df, name) in enumerate([(train_df, "Train"), (val_df, "Val"), (test_df, 
 
 plt.suptitle("Label Distribution Across Splits", fontsize=14, fontweight="bold")
 plt.tight_layout()
-plt.savefig("../results/plots/label_distribution.png", dpi=150)
+plt.savefig("./results/plots/label_distribution.png", dpi=150)
 plt.show()
 
 # %% [markdown]
@@ -118,7 +118,7 @@ axes[1, 1].set_title("Word Count Statistics", fontweight="bold", pad=20)
 
 plt.suptitle("Text Length Analysis", fontsize=14, fontweight="bold")
 plt.tight_layout()
-plt.savefig("../results/plots/text_length_analysis.png", dpi=150)
+plt.savefig("./results/plots/text_length_analysis.png", dpi=150)
 plt.show()
 
 # %% [markdown]

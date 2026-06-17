@@ -22,7 +22,7 @@ student:
 
 training:
   output_dir: "checkpoints/distillation"
-  num_epochs: 10
+  num_epochs: 60
   batch_size: 32
   max_seq_length: 128
   learning_rate: 5.0e-5

@@ -8,7 +8,7 @@ model:
 
 training:
   output_dir: "checkpoints/teacher"
-  num_epochs: 5
+  num_epochs: 50
   batch_size: 32
   max_seq_length: 128
   learning_rate: 2.0e-5
