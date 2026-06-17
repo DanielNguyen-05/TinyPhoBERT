@@ -1,0 +1,88 @@
+# Distillation Configuration — Multi-Level KD
+
+# Loss weights
+distillation:
+  alpha: 0.5           # Weight for Logit KD loss (KL divergence)
+  beta: 0.1            # Weight for Hidden State KD loss (MSE)
+  gamma: 0.1           # Weight for Attention KD loss (MSE)
+  temperature: 4.0     # Temperature for soft logits (higher = softer)
+  
+  # Which levels to enable
+  use_logit_kd: true
+  use_hidden_kd: true
+  use_attention_kd: true
+
+teacher:
+  model_path: "checkpoints/teacher/best_model"   # Fine-tuned teacher checkpoint
+  freeze: true                                    # Freeze teacher during distillation
+
+student:
+  config_path: "configs/student_config.yaml"
+  init_from_teacher: false    # If true, init student weights from teacher layers
+
+training:
+  output_dir: "checkpoints/distillation"
+  num_epochs: 10
+  batch_size: 32
+  max_seq_length: 128
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  fp16: true                          # ✅ BẬT khi chạy trên GPU CUDA
+  dataloader_num_workers: 4           # Tăng lên 8 nếu server có nhiều CPU cores
+  metric_for_best_model: "eval_f1_macro"
+
+data:
+  train_file: "data/processed/train.csv"
+  val_file: "data/processed/val.csv"
+  test_file: "data/processed/test.csv"
+  text_col: "free_text"
+  label_col: "label_id"
+  seed: 42
+
+logging:
+  use_wandb: false
+  use_tensorboard: true
+  project_name: "TinyPhoBERT"
+  run_name: "distillation-full"
+  log_dir: "logs/distillation"
+
+# Ablation Study Configurations
+ablation:
+  A1:
+    name: "TinyPhoBERT_no_distill"
+    use_logit_kd: false
+    use_hidden_kd: false
+    use_attention_kd: false
+    alpha: 0.0
+    beta: 0.0
+    gamma: 0.0
+
+  A2:
+    name: "TinyPhoBERT_logit_kd"
+    use_logit_kd: true
+    use_hidden_kd: false
+    use_attention_kd: false
+    alpha: 0.5
+    beta: 0.0
+    gamma: 0.0
+
+  A3:
+    name: "TinyPhoBERT_logit_hidden"
+    use_logit_kd: true
+    use_hidden_kd: true
+    use_attention_kd: false
+    alpha: 0.5
+    beta: 0.1
+    gamma: 0.0
+
+  A4:
+    name: "TinyPhoBERT_full"
+    use_logit_kd: true
+    use_hidden_kd: true
+    use_attention_kd: true
+    alpha: 0.5
+    beta: 0.1
+    gamma: 0.1

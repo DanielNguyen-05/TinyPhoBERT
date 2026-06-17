@@ -1,0 +1,173 @@
+# TinyPhoBERT
+
+> **TinyPhoBERT: A Multi-Level Knowledge Distillation Framework for Efficient Vietnamese Hate Speech Detection**
+
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
+[![HuggingFace](https://img.shields.io/badge/🤗-Transformers-yellow)](https://huggingface.co/)
+
+---
+
+## Overview
+
+TinyPhoBERT là một mô hình ngôn ngữ nhỏ gọn được tạo ra bằng kỹ thuật **Knowledge Distillation đa cấp** từ PhoBERT-base, phục vụ bài toán **Hate Speech Detection tiếng Việt**.
+
+| Model | Params | Macro-F1 | Inference |
+|-------|-------:|-------:|-------:|
+| PhoBERT-base (Teacher) | 135M | ~85% | 1x |
+| **TinyPhoBERT (Ours)** | **~40M** | **~84%** | **3x** |
+| DistilBERT | 66M | ~81% | 1.5x |
+| XLM-R | 270M | ~84% | 0.5x |
+
+---
+
+## Architecture
+
+```
+Input Text
+      ↓
+┌─────────────────────────────┐
+│    PhoBERT Teacher          │
+│    12 Layers / 768H / 12H   │
+└─────────────────────────────┘
+      ↓ Knowledge Distillation (3 levels)
+      
+Level 1: Logit KD     — KL(P_teacher, P_student)
+Level 2: Hidden KD    — MSE(H_teacher, H_student)
+Level 3: Attention KD — MSE(A_teacher, A_student)
+
+      ↓
+┌─────────────────────────────┐
+│    TinyPhoBERT Student      │
+│    6 Layers / 384H / 6H     │
+└─────────────────────────────┘
+      ↓
+Hate Speech Classifier
+      ↓
+CLEAN / OFFENSIVE / HATE
+```
+
+---
+
+## Dataset: ViHSD
+
+- ~33,400 comments tiếng Việt
+- Labels: `CLEAN (0)`, `OFFENSIVE (1)`, `HATE (2)`
+- Split: Train 80% / Val 10% / Test 10%
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/yourname/TinyPhoBERT
+cd TinyPhoBERT
+
+# Tạo virtual environment
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# venv\Scripts\activate   # Windows
+
+# Cài đặt dependencies
+pip install -r requirements.txt
+pip install -e .
+```
+
+---
+
+## Quick Start
+
+### 1. Tải dataset
+
+```bash
+python data/download_data.py
+```
+
+### 2. Fine-tune Teacher (PhoBERT-base)
+
+```bash
+python training/train_teacher.py --config configs/teacher_config.yaml
+```
+
+### 3. Train TinyPhoBERT với Multi-Level Distillation
+
+```bash
+python training/train_student.py --config configs/distillation_config.yaml
+```
+
+### 4. Đánh giá
+
+```bash
+python evaluation/evaluate.py --model_path checkpoints/tinyphobert_best.pt
+python evaluation/benchmark.py --model_path checkpoints/tinyphobert_best.pt
+```
+
+### 5. Ablation Study
+
+```bash
+python experiments/ablation.py --config configs/distillation_config.yaml
+# Hoặc chạy toàn bộ:
+bash experiments/run_all.sh
+```
+
+---
+
+## Distillation Loss
+
+```
+L = L_CE + α·L_KD + β·L_hidden + γ·L_att
+
+Trong đó:
+  L_CE     = Cross-Entropy (task loss)
+  L_KD     = KL Divergence (soft logits)
+  L_hidden = MSE (hidden states)
+  L_att    = MSE (attention maps)
+
+Default: α=0.5, β=0.1, γ=0.1
+```
+
+---
+
+## Ablation Study
+
+| Config | Description | Macro-F1 |
+|--------|-------------|-------:|
+| A1 | TinyPhoBERT (no distill) | ~81.0 |
+| A2 | + Logit KD | ~82.3 |
+| A3 | + Hidden KD | ~83.2 |
+| A4 | + Attention KD (Full) | ~84.0 |
+
+---
+
+## Project Structure
+
+```
+TinyPhoBERT/
+├── data/               # Dataset & preprocessing
+├── models/             # Teacher, Student, Distillation
+├── training/           # Training scripts
+├── evaluation/         # Metrics & Benchmarking
+├── experiments/        # Ablation study
+├── configs/            # YAML hyperparameters
+├── utils/              # Utilities
+└── notebooks/          # EDA, Analysis, Demo
+```
+
+---
+
+## Citation
+
+```bibtex
+@inproceedings{tinyphobert2024,
+  title={TinyPhoBERT: A Multi-Level Knowledge Distillation Framework for Efficient Vietnamese Hate Speech Detection},
+  author={Your Name},
+  booktitle={Proceedings of ...},
+  year={2024}
+}
+```
+
+---
+
+## License
+
+MIT License

@@ -1,0 +1,41 @@
+# Teacher Configuration — PhoBERT-base Fine-tuning
+
+model:
+  name: "vinai/phobert-base"         # HuggingFace model id
+  num_labels: 3                       # CLEAN, OFFENSIVE, HATE
+  dropout: 0.1
+  classifier_dropout: 0.1
+
+training:
+  output_dir: "checkpoints/teacher"
+  num_epochs: 5
+  batch_size: 32
+  max_seq_length: 128
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  fp16: true                          # ✅ BẬT khi chạy trên GPU CUDA
+  dataloader_num_workers: 4           # Tăng lên 8 nếu server có nhiều CPU cores
+  save_strategy: "epoch"
+  evaluation_strategy: "epoch"
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_f1_macro"
+  greater_is_better: true
+  logging_steps: 50
+
+data:
+  train_file: "data/processed/train.csv"
+  val_file: "data/processed/val.csv"
+  test_file: "data/processed/test.csv"
+  text_col: "free_text"
+  label_col: "label_id"
+  seed: 42
+
+logging:
+  use_wandb: false
+  use_tensorboard: true
+  project_name: "TinyPhoBERT"
+  run_name: "teacher-phobert-base"
+  log_dir: "logs/teacher"
