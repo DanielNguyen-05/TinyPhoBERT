@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.teacher import PhoBERTTeacher, get_teacher_tokenizer
 from models.student import TinyPhoBERT, build_student_from_config
-from models.distillation import (
+from models.distillation_balance import (
     MultiLevelDistillationLoss,
     DistillationTrainer,
     build_distillation_loss_from_config,
