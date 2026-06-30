@@ -50,3 +50,5 @@ Thumbs.db
 results/
 outputs/
 checkpoints/data/llm_embeddings/*.npy
+
+data/llm_embeddings/*.npy
