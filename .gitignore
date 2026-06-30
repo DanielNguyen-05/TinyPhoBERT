@@ -49,6 +49,5 @@ Thumbs.db
 # Results
 results/
 outputs/
-checkpoints/data/llm_embeddings/*.npy
-
-data/llm_embeddings/*.npy
+checkpoints/
+data/llm_embeddings/
