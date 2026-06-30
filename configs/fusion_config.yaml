@@ -1,0 +1,77 @@
+# configs/fusion_config.yaml
+
+data:
+  seed: 42
+  train_file: data/augmented/train.csv
+  val_file: data/augmented/val.csv
+  test_file: data/augmented/test.csv
+  augmented_dir: data/augmented
+  text_col: free_text
+  label_col: label_id
+
+model:
+  name: vinai/phobert-large
+  num_labels: 3
+  dropout: 0.1
+
+llm_extractor:
+  model_name: Qwen/Qwen2.5-0.5B
+  embedding_dir: data/llm_embeddings
+  max_length: 128
+  batch_size: 32
+
+fusion:
+  embedding_dir: data/llm_embeddings
+  llm_hidden_size: 896
+  llm_proj_dim: 512
+  fusion_dropout: 0.2
+
+training:
+  output_dir: checkpoints/fusion
+  # TĂNG từ 15 → 40: best_epoch=15=num_epochs chứng tỏ model vẫn đang cải
+  # thiện khi dừng — cần nhiều epoch hơn để fusion head hội tụ đúng.
+  # Early stopping (patience=8) sẽ dừng sớm nếu plateau.
+  num_epochs: 40
+  # TĂNG batch_size từ 16 → 32: batch nhỏ hơn → gradient noisy hơn cho
+  # fusion head mới train từ đầu. Batch 32 cân bằng tốt hơn.
+  batch_size: 32
+  max_seq_length: 128
+
+  # GIỮ LR 2e-5: phù hợp với PhoBERT-large. LLRD lo phần còn lại.
+  learning_rate: 0.00002
+  # TĂNG weight_decay 0.01 → 0.05: fusion head (train từ đầu) cần
+  # regularization mạnh hơn backbone pretrained để tránh overfit.
+  weight_decay: 0.05
+  # GIẢM warmup_ratio 0.1 → 0.06: với 40 epoch warmup 10% = 4 epoch,
+  # quá dài làm LR đến đỉnh muộn. 6% ≈ 2.4 epoch là điểm tốt hơn.
+  warmup_ratio: 0.06
+  max_grad_norm: 1.0
+
+  fp16: true
+
+  use_llrd: true
+  llrd_factor: 0.9
+  fusion_lr_multiplier: 10.0
+
+  use_focal_loss: true
+  focal_gamma: 2.0
+  label_smoothing: 0.1
+
+  # BẬT weighted sampler: đây là thay đổi quan trọng nhất.
+  # Với use_weighted_sampler=false, mỗi batch dominated bởi CLEAN (83%),
+  # fusion head học cách "đoán CLEAN" thay vì phân biệt OFF/HATE.
+  # WeightedSampler đảm bảo minority class có đủ positive pairs mỗi batch.
+  use_weighted_sampler: true
+  sampler_strength: 0.5
+
+  # TĂNG patience từ 5 → 8: cho model đủ thời gian vượt qua local plateau
+  # trong giai đoạn đầu khi fusion head đang adjust vào không gian PhoBERT.
+  early_stopping_patience: 8
+  dataloader_num_workers: 4
+
+logging:
+  project_name: TinyPhoBERT
+  run_name: llm-fusion-phobert-large-qwen05b
+  log_dir: logs/fusion
+  use_wandb: false
+  use_tensorboard: true

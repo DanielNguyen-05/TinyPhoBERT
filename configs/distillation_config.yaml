@@ -3,41 +3,66 @@
 # Loss weights
 distillation:
   alpha: 0.5           # Weight for Logit KD loss (KL divergence)
-  beta: 0.1            # Weight for Hidden State KD loss (MSE)
+  beta: 0.3            # Weight for Hidden State KD loss (tăng 0.1 → 0.3)
   gamma: 0.1           # Weight for Attention KD loss (MSE)
-  temperature: 4.0     # Temperature for soft logits (higher = softer)
-  
+  temperature: 4.0     # Temperature for soft logits
+
   # Which levels to enable
   use_logit_kd: true
   use_hidden_kd: true
   use_attention_kd: true
 
+  # ── Cải thiện class imbalance ──────────────────────────────────────────────
+  use_focal_loss: true      # Focal Loss cho task loss (L_CE term)
+  focal_gamma: 2.0          # γ=2 (Lin et al. 2017)
+  label_smoothing: 0.1      # Tránh overconfidence
+  hidden_loss_type: "cosine" # 'mse' | 'cosine' | 'both' cho hidden state alignment
+
 teacher:
-  model_path: "checkpoints/teacher/best_model"   # Fine-tuned teacher checkpoint
-  freeze: true                                    # Freeze teacher during distillation
+  model_path: "checkpoints/teacher_large/best_model"   # ← checkpoint của phobert-large
+  freeze: true
 
 student:
   config_path: "configs/student_config.yaml"
-  init_from_teacher: false    # If true, init student weights from teacher layers
+  init_from_teacher: true     # ✅ Khởi tạo student từ teacher weights (weight slicing)
+                              #    giảm distillation gap đáng kể
+                              #    đặt false để train từ đầu (ablation A0)
 
 training:
   output_dir: "checkpoints/distillation"
-  num_epochs: 60
+  num_epochs: 30               # Tăng từ 10 → 30 (cần nhiều epoch để hội tụ)
   batch_size: 32
   max_seq_length: 128
-  learning_rate: 5.0e-5
+  # GIẢM từ 5.0e-5 → 2.0e-5: best_epoch=5/60 ở lần chạy trước cho thấy LR
+  # 5e-5 quá cao cho student 35M tham số tối ưu đồng thời 4 loss term, đặc
+  # biệt khi init_from_teacher=true khiến model khởi đầu đã ở gần điểm tốt
+  # (dễ bị bước gradient lớn "đá văng" ra khỏi vùng tốt đó).
+  learning_rate: 2.0e-5
   weight_decay: 0.01
-  warmup_ratio: 0.1
+  # GIẢM warmup_ratio để LR đạt đỉnh sớm hơn, rồi cosine schedule giảm dần
+  # ngay sau đó — tránh giữ LR cao kéo dài như linear schedule cũ.
+  warmup_ratio: 0.03
+  use_cosine_schedule: true
   gradient_accumulation_steps: 1
   max_grad_norm: 1.0
-  fp16: true                          # ✅ BẬT khi chạy trên GPU CUDA
-  dataloader_num_workers: 4           # Tăng lên 8 nếu server có nhiều CPU cores
+  fp16: true                  # ✅ BẬT khi chạy trên GPU CUDA
+  dataloader_num_workers: 4
   metric_for_best_model: "eval_f1_macro"
+  use_weighted_sampler: true   # WeightedRandomSampler
+  sampler_strength: 0.5        # Soft rebalancing (0.5 = half-way, 1.0 = full balance)
+  early_stopping_patience: 8   # Dừng nếu val Macro-F1 không cải thiện sau 8 epochs
 
 data:
-  train_file: "data/processed/train.csv"
-  val_file: "data/processed/val.csv"
-  test_file: "data/processed/test.csv"
+  # QUAN TRỌNG: Trỏ vào data/augmented/ (đã được preprocess + augment bởi
+  # data/prepare_data.py) — KHÔNG trỏ vào data/processed/ (dữ liệu thô).
+  #
+  # Lý do bắt buộc: checkpoints/teacher_large/best_model được fine-tune
+  # trên text ĐÃ preprocess. Nếu distillation đưa text thô vào teacher,
+  # soft-logits của teacher sẽ bị nhiễu vì teacher chưa từng thấy dạng
+  # text đó lúc training → tín hiệu distillation (KD loss) sai lệch.
+  train_file: "data/augmented/train.csv"   # Đã preprocess + augment minority classes
+  val_file: "data/augmented/val.csv"       # Đã preprocess, KHÔNG augment
+  test_file: "data/augmented/test.csv"     # Đã preprocess, KHÔNG augment
   text_col: "free_text"
   label_col: "label_id"
   seed: 42

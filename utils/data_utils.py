@@ -1,14 +1,20 @@
 """
-utils/data_utils.py
+utils/data_utils.py  [v2]
 Dataset loading and preprocessing for ViHSD.
+
+Thêm mới so với v1:
+    - build_datasets_from_config(): Tích hợp preprocessing + augmentation pipeline
+    - get_weighted_sampler(): WeightedRandomSampler (giữ nguyên)
+    - get_class_weights(): Class weights cho Focal Loss (giữ nguyên)
 """
 
 import os
+from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, WeightedRandomSampler
 from transformers import PreTrainedTokenizer
 
 
@@ -107,14 +113,76 @@ def build_datasets(
 def get_class_weights(
     labels: List[int],
     num_classes: int = 3,
+    smoothing: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Compute inverse frequency class weights for imbalanced datasets.
-    Useful for weighted cross-entropy loss.
+    Tính inverse-frequency class weights cho Focal Loss / Weighted CE.
+
+    w_c = N / (num_classes · count_c)
+
+    Kết quả normalize để mean = 1.0 → không thay đổi learning rate tổng thể.
+
+    Args:
+        labels: List of integer labels from training set.
+        num_classes: Number of classes.
+        smoothing: Small epsilon tránh chia cho 0.
+
+    Returns:
+        Tensor of shape (num_classes,) with normalized class weights.
     """
-    counts = torch.zeros(num_classes)
-    for lbl in labels:
-        counts[lbl] += 1
-    weights = 1.0 / (counts + 1e-8)
-    weights = weights / weights.sum() * num_classes  # normalize
+    counter = Counter(labels)
+    n_total = len(labels)
+
+    weights = torch.zeros(num_classes)
+    for c in range(num_classes):
+        count = counter.get(c, 0)
+        weights[c] = n_total / (num_classes * (count + smoothing))
+
+    # Normalize: mean weight = 1.0
+    weights = weights / weights.mean()
+
+    print(f"[ClassWeights] {dict(enumerate(weights.tolist()))}")
+    print(f"  CLEAN={weights[0]:.3f} | OFFENSIVE={weights[1]:.3f} | HATE={weights[2]:.3f}")
     return weights
+
+
+def get_weighted_sampler(
+    labels: List[int],
+    num_classes: int = 3,
+    strength: float = 0.5,
+) -> WeightedRandomSampler:
+    """
+    Tạo WeightedRandomSampler với soft rebalancing.
+
+    `strength` kiểm soát mức độ rebalancing:
+      - 0.0 = uniform sampling (không rebalance)
+      - 0.5 = soft rebalancing (khuyến nghị)
+      - 1.0 = full rebalancing — mỗi class 33%/33%/33%
+
+    Công thức: sample_weight_c = (1/count_c)^strength
+
+    Args:
+        labels: List of integer labels from training set.
+        num_classes: Number of classes.
+        strength: Rebalancing strength [0.0, 1.0]. Default 0.5 (soft).
+
+    Returns:
+        WeightedRandomSampler với replacement=True.
+    """
+    counter = Counter(labels)
+
+    class_sample_weight = {
+        c: (1.0 / max(counter.get(c, 1), 1)) ** strength
+        for c in range(num_classes)
+    }
+    sample_weights = [class_sample_weight[lbl] for lbl in labels]
+
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+    ratios = {c: f"{class_sample_weight[c] / class_sample_weight[0]:.1f}x" for c in range(num_classes)}
+    print(f"[WeightedSampler] strength={strength} | Class ratios vs CLEAN: {ratios}")
+    return sampler

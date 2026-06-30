@@ -53,7 +53,7 @@ class TinyPhoBERT(nn.Module):
         hidden_dropout_prob: float = 0.1,
         attention_probs_dropout_prob: float = 0.1,
         classifier_dropout: float = 0.1,
-        teacher_hidden_size: int = 768,
+        teacher_hidden_size: int = 1024,
         layer_norm_eps: float = 1e-5,
         type_vocab_size: int = 1,
     ) -> None:
@@ -83,18 +83,16 @@ class TinyPhoBERT(nn.Module):
         )
 
         # Main transformer backbone
-        # Set _attn_implementation to "eager" so that output_attentions=True
-        # works correctly in newer transformers that default to SDPA.
         self.config._attn_implementation = "eager"
         self.backbone = RobertaModel(self.config, add_pooling_layer=False)
-
 
         # Classifier head
         self.dropout = nn.Dropout(classifier_dropout)
         self.classifier = nn.Linear(hidden_size, num_labels)
 
-        # Projection layer: align student hidden states (384) → teacher (768)
-        # Used ONLY during distillation, not for inference
+        # Projection layer: align student hidden states → teacher hidden size
+        # Used ONLY during distillation, not inference
+        # teacher_hidden_size = 768 (base) | 1024 (large)
         self.hidden_projection = nn.Linear(hidden_size, teacher_hidden_size, bias=False)
 
         # Initialize weights
@@ -105,6 +103,125 @@ class TinyPhoBERT(nn.Module):
         nn.init.normal_(self.classifier.weight, std=0.02)
         nn.init.zeros_(self.classifier.bias)
         nn.init.normal_(self.hidden_projection.weight, std=0.02)
+
+    def init_from_teacher(
+        self,
+        teacher_model,
+        layer_mapping: Optional[dict] = None,
+    ) -> None:
+        """
+        Khởi tạo student từ weights của teacher bằng kỹ thuật weight slicing.
+
+        Hỗ trợ cả PhoBERT-base (12L/768H) và PhoBERT-large (24L/1024H).
+
+        Layer mapping mặc định:
+          Base  (12L): Student [0..5] ← Teacher [0,2,4,6,8,10]  (bước 2)
+          Large (24L): Student [0..5] ← Teacher [0,4,8,12,16,20] (bước 4)
+
+        Args:
+            teacher_model: PhoBERTTeacher instance.
+            layer_mapping: Dict {student_idx: teacher_idx}. Tự động nếu None.
+        """
+        teacher_backbone = (
+            teacher_model.backbone
+            if hasattr(teacher_model, "backbone")
+            else teacher_model
+        )
+        t_num_layers = teacher_model.num_layers if hasattr(teacher_model, "num_layers") else 12
+        d_t = teacher_model.hidden_size if hasattr(teacher_model, "hidden_size") else 768
+        d_s = self.hidden_size  # 384
+
+        # Auto layer mapping: distribute evenly across teacher layers
+        if layer_mapping is None:
+            step = t_num_layers // self.num_layers  # 2 for base-12, 4 for large-24
+            layer_mapping = {i: i * step for i in range(self.num_layers)}
+
+        print(f"[InitFromTeacher] Teacher: {t_num_layers}L/{d_t}H | Student: {self.num_layers}L/{d_s}H")
+        print(f"[InitFromTeacher] Layer mapping: {layer_mapping}")
+
+        student_backbone = self.backbone
+        n_copied = 0
+        n_skipped = 0
+
+        # ── 1. Copy Embeddings (slice hidden dim) ──────────────────────────────
+        t_emb = teacher_backbone.embeddings
+        s_emb = student_backbone.embeddings
+
+        with torch.no_grad():
+            s_emb.word_embeddings.weight.copy_(
+                t_emb.word_embeddings.weight[:, :d_s]
+            )
+            if hasattr(t_emb, "position_embeddings") and hasattr(s_emb, "position_embeddings"):
+                s_emb.position_embeddings.weight.copy_(
+                    t_emb.position_embeddings.weight[:, :d_s]
+                )
+            if hasattr(t_emb, "LayerNorm") and hasattr(s_emb, "LayerNorm"):
+                s_emb.LayerNorm.weight.copy_(t_emb.LayerNorm.weight[:d_s])
+                s_emb.LayerNorm.bias.copy_(t_emb.LayerNorm.bias[:d_s])
+
+        print(f"[InitFromTeacher] Embeddings: sliced {d_t}→{d_s}")
+
+        # ── 2. Copy Transformer Layers ──────────────────────────────────────────
+        t_layers = teacher_backbone.encoder.layer
+        s_layers = student_backbone.encoder.layer
+        i_s = self.backbone.config.intermediate_size  # 1536
+        i_t = teacher_backbone.config.intermediate_size  # 3072 (base) | 4096 (large)
+
+        for s_idx, t_idx in layer_mapping.items():
+            if s_idx >= len(s_layers) or t_idx >= len(t_layers):
+                print(f"  [Skip] S[{s_idx}] ← T[{t_idx}]: out of range")
+                n_skipped += 1
+                continue
+
+            t_layer = t_layers[t_idx]
+            s_layer = s_layers[s_idx]
+
+            with torch.no_grad():
+                # Attention Q, K, V
+                for attn_name in ["query", "key", "value"]:
+                    t_W = getattr(t_layer.attention.self, attn_name)
+                    s_W = getattr(s_layer.attention.self, attn_name)
+                    s_W.weight.copy_(t_W.weight[:d_s, :d_s])
+                    s_W.bias.copy_(t_W.bias[:d_s])
+
+                # Attention output projection
+                s_layer.attention.output.dense.weight.copy_(
+                    t_layer.attention.output.dense.weight[:d_s, :d_s]
+                )
+                s_layer.attention.output.dense.bias.copy_(
+                    t_layer.attention.output.dense.bias[:d_s]
+                )
+                s_layer.attention.output.LayerNorm.weight.copy_(
+                    t_layer.attention.output.LayerNorm.weight[:d_s]
+                )
+                s_layer.attention.output.LayerNorm.bias.copy_(
+                    t_layer.attention.output.LayerNorm.bias[:d_s]
+                )
+
+                # FFN
+                s_layer.intermediate.dense.weight.copy_(
+                    t_layer.intermediate.dense.weight[:i_s, :d_s]
+                )
+                s_layer.intermediate.dense.bias.copy_(
+                    t_layer.intermediate.dense.bias[:i_s]
+                )
+                s_layer.output.dense.weight.copy_(
+                    t_layer.output.dense.weight[:d_s, :i_s]
+                )
+                s_layer.output.dense.bias.copy_(
+                    t_layer.output.dense.bias[:d_s]
+                )
+                s_layer.output.LayerNorm.weight.copy_(
+                    t_layer.output.LayerNorm.weight[:d_s]
+                )
+                s_layer.output.LayerNorm.bias.copy_(
+                    t_layer.output.LayerNorm.bias[:d_s]
+                )
+
+                n_copied += 1
+            print(f"  S[{s_idx}] ← T[{t_idx}]: ✓")
+
+        print(f"[InitFromTeacher] Done: {n_copied} layers copied, {n_skipped} skipped.")
 
     def forward(
         self,
@@ -216,6 +333,6 @@ def build_student_from_config(config: dict) -> TinyPhoBERT:
         hidden_dropout_prob=model_cfg.get("hidden_dropout_prob", 0.1),
         attention_probs_dropout_prob=model_cfg.get("attention_probs_dropout_prob", 0.1),
         classifier_dropout=model_cfg.get("classifier_dropout", 0.1),
-        teacher_hidden_size=model_cfg.get("teacher_hidden_size", 768),
+        teacher_hidden_size=model_cfg.get("teacher_hidden_size", 1024),
         layer_norm_eps=model_cfg.get("layer_norm_eps", 1e-5),
     )

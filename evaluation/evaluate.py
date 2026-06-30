@@ -197,7 +197,13 @@ def main():
     parser.add_argument("--model_type", choices=["teacher", "student"], default="student")
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--config_path", type=str, default="configs/student_config.yaml")
-    parser.add_argument("--test_file", type=str, default="data/processed/test.csv")
+    parser.add_argument(
+        "--test_file", type=str, default="data/augmented/test.csv",
+        help="Test set ĐÃ preprocess (cùng pipeline với lúc train). "
+             "KHÔNG dùng data/processed/test.csv (thô) vì model được "
+             "train trên text đã preprocess — đánh giá trên text thô "
+             "sẽ cho kết quả sai lệch do train/inference mismatch.",
+    )
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--compare_all", action="store_true",

@@ -4,7 +4,7 @@ setup(
     name="tinyphobert",
     version="1.0.0",
     description="TinyPhoBERT: Multi-Level Knowledge Distillation for Vietnamese Hate Speech Detection",
-    author="Your Name",
+    author="DangHaiNguyen",
     packages=find_packages(exclude=["tests*", "notebooks*"]),
     python_requires=">=3.9",
     install_requires=[

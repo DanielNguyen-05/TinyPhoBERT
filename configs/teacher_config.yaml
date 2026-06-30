@@ -1,34 +1,94 @@
-# Teacher Configuration — PhoBERT-base Fine-tuning
+# Teacher Configuration v2
+# PhoBERT-large + Preprocessing + EDA Augmentation + Better Training
 
 model:
-  name: "vinai/phobert-base"         # HuggingFace model id
+  name: "vinai/phobert-large"         # PhoBERT-large (24L/1024H/370M)
   num_labels: 3                       # CLEAN, OFFENSIVE, HATE
-  dropout: 0.1
-  classifier_dropout: 0.1
+  # TĂNG dropout để chống overfitting: train F1=98.9% vs val F1=67.5% là gap
+  # quá lớn, đặc biệt khi SupCon tạo biểu diễn sắc nét, dễ overfit hơn CE.
+  dropout: 0.3
+  classifier_dropout: 0.2
+
+# ── Preprocessing (Phase 1 từ paper arXiv:2206.00524) ─────────────────────────
+# Áp dụng cho cả train/val/test splits
+preprocessing:
+  enabled: true
+  lowercase: true               # Lowercase tất cả
+  remove_url: true              # Xóa URLs (https://, fb.com, ...)
+  normalize_unicode: true       # NFC normalization
+  reduce_repeat: true           # vuilllll → vuill (giữ 2 ký tự lặp)
+  apply_teencode: true          # Teen code dict: vl→vãi lồn, k→không, ...
+  remove_emoji: false           # Giữ emoji (có thể mang sentiment quan trọng)
+  remove_phone: true            # Ẩn số điện thoại
+
+# ── EDA Data Augmentation (từ paper arXiv:2502.08960 + 2206.00524) ────────────
+# Chỉ áp dụng cho TRAINING set, KHÔNG áp dụng val/test
+augmentation:
+  enabled: true
+  target_classes: [1, 2]        # Chỉ augment OFFENSIVE (1) và HATE (2)
+  augment_ratio: 0.5            # Target: minority → 50% của majority size
+                                # 0.5 = soft balance (khuyến nghị)
+                                # 1.0 = full balance (aggressive)
+  num_aug_per_sample: 3         # Tạo 3 augmented samples từ mỗi original
+
+  # EDA operation parameters (Wei & Zou, 2019)
+  alpha_sr: 0.1   # Synonym Replacement: thay 10% từ bằng synonym
+  alpha_ri: 0.1   # Random Insertion: chèn thêm 10% từ
+  alpha_rs: 0.1   # Random Swap: hoán đổi 10% cặp từ
+  p_rd: 0.1       # Random Deletion: xóa mỗi từ với prob=0.1
 
 training:
-  output_dir: "checkpoints/teacher"
-  num_epochs: 50
+  output_dir: "checkpoints/teacher_large"
+  num_epochs: 30               # Với early stopping patience=6, thực tế dừng ~20 epoch
   batch_size: 32
   max_seq_length: 128
   learning_rate: 2.0e-5
-  weight_decay: 0.01
+  # TĂNG weight_decay 0.01 → 0.1: regularization L2 mạnh hơn để chống
+  # overfitting (train F1 98.9% vs val F1 67.5%). Kết hợp với dropout tăng.
+  weight_decay: 0.1
   warmup_ratio: 0.1
   gradient_accumulation_steps: 1
   max_grad_norm: 1.0
-  fp16: true                          # ✅ BẬT khi chạy trên GPU CUDA
-  dataloader_num_workers: 4           # Tăng lên 8 nếu server có nhiều CPU cores
-  save_strategy: "epoch"
-  evaluation_strategy: "epoch"
-  load_best_model_at_end: true
-  metric_for_best_model: "eval_f1_macro"
-  greater_is_better: true
-  logging_steps: 50
+  fp16: false                  # BẬT khi chạy GPU CUDA
+  dataloader_num_workers: 4
+  early_stopping_patience: 6
+
+  # ── Scheduler ──────────────────────────────────────────────────────────────
+  use_cosine_schedule: true    # Cosine annealing (tốt hơn linear cho dài hạn)
+
+  # ── Class Imbalance Handling ───────────────────────────────────────────────
+  use_focal_loss: true         # Focal Loss: phạt OFFENSIVE/HATE nhiều hơn
+  focal_gamma: 2.0             # γ=2 (Lin et al. 2017)
+  label_smoothing: 0.1         # Tránh overconfidence
+  use_weighted_sampler: true   # WeightedRandomSampler — QUAN TRỌNG khi bật
+                                # SupCon: đảm bảo mỗi batch có đủ sample
+                                # OFFENSIVE/HATE để tạo positive pairs, nếu
+                                # không SupCon mất tác dụng với minority class
+  sampler_strength: 0.5        # Soft rebalancing
+
+  # ── Supervised Contrastive Learning (Khosla et al., 2020) ──────────────────
+  # Kéo embedding cùng class lại gần nhau trong pooled_output space, giúp
+  # tách biệt OFFENSIVE/HATE khỏi CLEAN rõ ràng hơn so với chỉ dùng CE/Focal.
+  use_supcon: true
+  supcon_proj_dim: 256
+  # GIẢM 0.3 → 0.1: val loss tăng liên tục (1.66→1.85) trong khi train loss
+  # giảm (0.82→0.74) — tín hiệu λ=0.3 đang cho SupCon quá nhiều ảnh hưởng,
+  # tạo mâu thuẫn với task loss trên augmented val set (overfitting).
+  supcon_weight: 0.1
+  supcon_temperature: 0.07      # τ — giá trị nhỏ làm loss "sắc" hơn
+
+  # ── Regularization ─────────────────────────────────────────────────────────
+  use_llrd: true               # Layer-wise LR Decay
+  llrd_factor: 0.9             # LR decay per layer (0.9 = 10% decay)
+                               # lower layers → lower LR → better feature retention
+
+  # ── Early Stopping ─────────────────────────────────────────────────────────
 
 data:
-  train_file: "data/processed/train.csv"
+  train_file: "data/processed/train.csv"   # Input cho prepare_data.py (dữ liệu gốc, đã split)
   val_file: "data/processed/val.csv"
   test_file: "data/processed/test.csv"
+  augmented_dir: "data/augmented"          # Output của prepare_data.py / Input cho train_teacher.py
   text_col: "free_text"
   label_col: "label_id"
   seed: 42
@@ -37,5 +97,5 @@ logging:
   use_wandb: false
   use_tensorboard: true
   project_name: "TinyPhoBERT"
-  run_name: "teacher-phobert-base"
+  run_name: "teacher-phobert-large-augmented"
   log_dir: "logs/teacher"
