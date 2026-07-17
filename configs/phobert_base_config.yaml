@@ -1,5 +1,9 @@
+# Teacher Configuration — BẢN KHÔI PHỤC
+# Đạt Macro-F1=65.38% | accuracy=87.28% | best_epoch=22
+# (KHÔNG có SupCon — SupCon được thêm sau này gây NaN và giảm hiệu suất)
+
 model:
-  name: "vinai/phobert-large"         # PhoBERT-large (24L/1024H/370M)
+  name: "vinai/phobert-base"    # 12L/768H/135M — nhỏ hơn large 2.6 lần
   num_labels: 3                       # CLEAN, OFFENSIVE, HATE
   dropout: 0.1
   classifier_dropout: 0.1
@@ -27,8 +31,10 @@ augmentation:
   p_rd: 0.1
 
 training:
-  output_dir: "checkpoints/teacher_restored"
-  num_epochs: 50
+  # QUAN TRỌNG: dùng thư mục RIÊNG BIỆT, KHÔNG dùng chung với bất kỳ
+  # script nào khác (fusion, qwen, distillation) để tránh bị ghi đè.
+  output_dir: "checkpoints/phobert_base"
+  num_epochs: 30
   batch_size: 32
   max_seq_length: 128
   learning_rate: 2.0e-5
@@ -38,7 +44,7 @@ training:
   max_grad_norm: 1.0
   fp16: false                  # BẬT khi chạy GPU CUDA (--fp16)
   dataloader_num_workers: 4
-  early_stopping_patience: 8
+  early_stopping_patience: 4
 
   use_cosine_schedule: true
 
@@ -64,5 +70,5 @@ logging:
   use_wandb: false
   use_tensorboard: true
   project_name: "TinyPhoBERT"
-  run_name: "teacher-phobert-large-restored"
-  log_dir: "logs/teacher_restored"
+  run_name: "phobert-base-hsd"
+  log_dir: "logs/phobert_base"

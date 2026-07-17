@@ -1,0 +1,71 @@
+# configs/qwen_config.yaml
+#
+# QLoRA fine-tuning Qwen2.5 cho Vietnamese Hate Speech Detection.
+# Qwen2.5-3B: cân bằng khả năng và tính khả thi trên RTX 4060 Ti 16GB.
+#   - Base model 4-bit (nf4): ~1.9GB VRAM cho weights
+#   - LoRA adapter: ~40-60M trainable params
+#   - Ước tính tổng VRAM: 8-11GB
+#
+# Đổi model.name để thử size khác:
+#   Qwen/Qwen2.5-1.5B (nhẹ hơn, ~5-6GB VRAM)
+#   Qwen/Qwen2.5-3B   (khuyến nghị)
+#   Qwen/Qwen2.5-7B   (mạnh nhất, ~12-14GB VRAM)
+
+model:
+  name: "Qwen/Qwen2.5-3B"
+  num_labels: 3
+  max_seq_length: 128
+
+quantization:
+  load_in_4bit: true
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_compute_dtype: "bfloat16"
+  bnb_4bit_use_double_quant: true
+
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  bias: "none"
+
+data:
+  train_file: "data/augmented/train.csv"
+  val_file: "data/augmented/val.csv"
+  test_file: "data/augmented/test.csv"
+  text_col: "free_text"
+  label_col: "label_id"
+  seed: 42
+
+training:
+  output_dir: "checkpoints/qwen_classifier"
+  num_epochs: 10
+  batch_size: 8
+  gradient_accumulation_steps: 4
+
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.06
+  max_grad_norm: 0.3
+
+  use_focal_loss: true
+  focal_gamma: 2.0
+  label_smoothing: 0.1
+
+  use_weighted_sampler: true
+  sampler_strength: 0.5
+
+  early_stopping_patience: 5
+  dataloader_num_workers: 2
+
+logging:
+  project_name: "TinyPhoBERT"
+  run_name: "qwen2.5-3b-lora-hsd"
+  log_dir: "logs/qwen"
