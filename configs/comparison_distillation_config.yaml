@@ -1,0 +1,54 @@
+# Train DAMS-TinyPhoBERT with the existing multi-level KD pipeline.
+distillation:
+  alpha: 0.5
+  beta: 0.3
+  gamma: 0.1
+  temperature: 4.0
+  use_logit_kd: true
+  use_hidden_kd: true
+  use_attention_kd: true
+  use_focal_loss: true
+  focal_gamma: 2.0
+  label_smoothing: 0.05
+  hidden_loss_type: cosine
+
+teacher:
+  model_name: vinai/phobert-large
+  model_path: checkpoints/teacher_strong/best_model.pt
+  freeze: true
+
+student:
+  config_path: configs/comparison_student_config.yaml
+  init_from_teacher: true
+
+training:
+  output_dir: checkpoints/comparison
+  num_epochs: 30
+  batch_size: 32
+  max_seq_length: 128
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  use_cosine_schedule: true
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  fp16: true
+  dataloader_num_workers: 4
+  use_weighted_sampler: true
+  sampler_strength: 0.5
+  early_stopping_patience: 8
+
+data:
+  train_file: data/augmented/train.csv
+  val_file: data/augmented/val.csv
+  test_file: data/augmented/test.csv
+  text_col: free_text
+  label_col: label_id
+  seed: 42
+
+logging:
+  use_wandb: false
+  use_tensorboard: true
+  project_name: TinyPhoBERT
+  run_name: DAMS-TinyPhoBERT
+  log_dir: logs/comparison

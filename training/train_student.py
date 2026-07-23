@@ -235,15 +235,14 @@ def train(config: dict, run_name: Optional[str] = None) -> dict:
     # ── Teacher ────────────────────────────────────────────────────────────────
     teacher_path = config["teacher"]["model_path"]
     console.print(f"[bold cyan]Loading Teacher from: {teacher_path}[/bold cyan]")
-    if os.path.isfile(os.path.join(teacher_path, "../best_model.pt")) or \
-       os.path.isfile(teacher_path + ".pt") or \
-       os.path.isfile(os.path.join(teacher_path, "best_model.pt")):
-        # Load from our custom checkpoint
-        ckpt_file = (
-            os.path.join(teacher_path, "best_model.pt")
-            if os.path.isfile(os.path.join(teacher_path, "best_model.pt"))
-            else teacher_path + ".pt"
-        )
+    checkpoint_candidates = [
+        teacher_path,
+        teacher_path + ".pt",
+        os.path.join(teacher_path, "best_model.pt"),
+        os.path.join(os.path.dirname(teacher_path), "best_model.pt"),
+    ]
+    ckpt_file = next((p for p in checkpoint_candidates if os.path.isfile(p)), None)
+    if ckpt_file is not None:
         teacher = PhoBERTTeacher.from_pretrained_checkpoint(ckpt_file)
     elif os.path.isdir(teacher_path):
         # HuggingFace format
@@ -272,8 +271,10 @@ def train(config: dict, run_name: Optional[str] = None) -> dict:
     init_from_teacher_flag = config.get("student", {}).get("init_from_teacher", True)
     if init_from_teacher_flag:
         console.print("[bold cyan]Initializing student from teacher weights (weight slicing)...[/bold cyan]")
-        # Unfreeze teacher temporarily for weight copy (read-only)
-        student.init_from_teacher(teacher)
+        init_mapping = config.get("student", {}).get("model", {}).get("layer_mapping")
+        if init_mapping:
+            init_mapping = {int(k): int(v) for k, v in init_mapping.items()}
+        student.init_from_teacher(teacher, layer_mapping=init_mapping)
         console.print("  [bold green]✓ Student initialized from teacher layers[/bold green]")
 
     # ── Distillation Loss ─────────────────────────────────────────────────

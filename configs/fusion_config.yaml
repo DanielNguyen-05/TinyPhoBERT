@@ -1,4 +1,5 @@
-# configs/fusion_config.yaml
+# configs/fusion_config.yaml — v2
+# Cải thiện toàn diện cho OFFENSIVE F1 và Macro F1
 
 data:
   seed: 42
@@ -12,7 +13,7 @@ data:
 model:
   name: vinai/phobert-large
   num_labels: 3
-  dropout: 0.1
+  dropout: 0.1          # Dropout trong HybridPhoBERTPooling
 
 llm_extractor:
   model_name: Qwen/Qwen2.5-0.5B
@@ -26,24 +27,22 @@ fusion:
   llm_proj_dim: 512
   fusion_dropout: 0.2
 
+  # Gated interaction thay vì attention trên hai vector pooled. Attention
+  # với chỉ một key/value token bị suy biến (softmax luôn bằng 1).
+  use_cross_attention: true
+
+  # [NEW v2] Hybrid Pooling: CLS + mean + max → richer PhoBERT repr
+  # Đặc biệt hữu ích với câu ngắn (avg 11 từ trên ViHSD)
+  use_hybrid_pooling: true
+
 training:
   output_dir: checkpoints/fusion
-  # TĂNG từ 15 → 40: best_epoch=15=num_epochs chứng tỏ model vẫn đang cải
-  # thiện khi dừng — cần nhiều epoch hơn để fusion head hội tụ đúng.
-  # Early stopping (patience=8) sẽ dừng sớm nếu plateau.
   num_epochs: 40
-  # TĂNG batch_size từ 16 → 32: batch nhỏ hơn → gradient noisy hơn cho
-  # fusion head mới train từ đầu. Batch 32 cân bằng tốt hơn.
   batch_size: 32
   max_seq_length: 128
 
-  # GIỮ LR 2e-5: phù hợp với PhoBERT-large. LLRD lo phần còn lại.
   learning_rate: 0.00002
-  # TĂNG weight_decay 0.01 → 0.05: fusion head (train từ đầu) cần
-  # regularization mạnh hơn backbone pretrained để tránh overfit.
   weight_decay: 0.05
-  # GIẢM warmup_ratio 0.1 → 0.06: với 40 epoch warmup 10% = 4 epoch,
-  # quá dài làm LR đến đỉnh muộn. 6% ≈ 2.4 epoch là điểm tốt hơn.
   warmup_ratio: 0.06
   max_grad_norm: 1.0
 
@@ -52,26 +51,44 @@ training:
   use_llrd: true
   llrd_factor: 0.9
   fusion_lr_multiplier: 10.0
+  fusion_weight_decay: 0.1   # Cao hơn để regularize fusion head
 
+  # [FIX v2] Focal Loss với gamma cao hơn để phạt CLEAN (easy examples) mạnh hơn
+  # γ=3.0 (tăng từ 2.0): khi OFFENSIVE:CLEAN = 1:12, cần γ lớn hơn để
+  # focus vào hard examples (OFFENSIVE bị classify sai)
   use_focal_loss: true
-  focal_gamma: 2.0
-  label_smoothing: 0.1
+  focal_gamma: 3.0
 
-  # BẬT weighted sampler: đây là thay đổi quan trọng nhất.
-  # Với use_weighted_sampler=false, mỗi batch dominated bởi CLEAN (83%),
-  # fusion head học cách "đoán CLEAN" thay vì phân biệt OFF/HATE.
-  # WeightedSampler đảm bảo minority class có đủ positive pairs mỗi batch.
+  # [FIX v2] Giảm label_smoothing: 0.1 → 0.05
+  # Label smoothing cao làm mờ signal của minority class OFFENSIVE
+  # 0.05 vẫn đủ để tránh overconfidence nhưng không "hy sinh" OFFENSIVE
+  label_smoothing: 0.05
+
+  # [NEW v2] Supervised Contrastive Learning cho Fusion Model
+  # Kéo OFFENSIVE/HATE embeddings ra xa CLEAN trong fusion space
+  # SupCon đã có trong teacher nhưng chưa có trong fusion model — thêm vào
+  use_supcon: true
+  supcon_weight: 0.1
+  supcon_temperature: 0.07
+
+  # [NEW v2] Logit Adjustment (Menon et al., NeurIPS 2020)
+  # Adjust logits theo class prior để cải thiện minority class precision
+  # tau=0.3: gentle adjustment (tau=1.0 = full adjustment)
+  logit_adjustment_tau: 0.3
+
+  # [IMPROVE v2] Tăng sampler_strength: 0.5 → 0.7
+  # Aggressive hơn trong oversampling OFFENSIVE/HATE
+  # strength=0.7: OFFENSIVE samples được sample ~4.5x nhiều hơn CLEAN
+  # (vs 2.8x với strength=0.5)
   use_weighted_sampler: true
-  sampler_strength: 0.5
+  sampler_strength: 0.7
 
-  # TĂNG patience từ 5 → 8: cho model đủ thời gian vượt qua local plateau
-  # trong giai đoạn đầu khi fusion head đang adjust vào không gian PhoBERT.
   early_stopping_patience: 8
   dataloader_num_workers: 4
 
 logging:
   project_name: TinyPhoBERT
-  run_name: llm-fusion-phobert-large-qwen05b
+  run_name: llm-fusion-v2-phobert-large
   log_dir: logs/fusion
   use_wandb: false
   use_tensorboard: true

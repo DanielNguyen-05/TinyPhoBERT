@@ -1,19 +1,13 @@
 """
 training/train_fusion.py
 
-Train LLM-Fused PhoBERT cho Vietnamese Hate Speech Detection.
+Train LLM-Fused PhoBERT cho Vietnamese Hate Speech Detection — v2.
 
-Yêu cầu: đã chạy data/extract_llm_embeddings.py để có:
-    data/llm_embeddings/train_llm_embeddings.npy
-    data/llm_embeddings/val_llm_embeddings.npy
-    data/llm_embeddings/test_llm_embeddings.npy
-
-Điểm khác biệt chính so với train_teacher.py:
-    - DataLoader trả thêm llm_embedding tensor mỗi batch
-    - Model forward nhận thêm llm_embeddings argument
-    - PhoBERT backbone dùng LLRD (layer-wise LR decay)
-    - LLM projection head và FusionMLP dùng LR cao hơn backbone
-      (vì chúng train từ đầu, không phải pretrained)
+Thay đổi v2 so với v1:
+    - Tính class_prior từ training labels → Logit Adjustment
+    - Build model truyền class_prior vào builder
+    - Tính class_weights chính xác hơn (OFFENSIVE weight cao hơn)
+    - In thêm per-class F1 detail mỗi epoch để track OFFENSIVE
 
 Usage:
     python training/train_fusion.py --config configs/fusion_config.yaml
@@ -24,9 +18,11 @@ import argparse
 import json
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import torch
 import yaml
@@ -136,9 +132,8 @@ def build_optimizer_with_llrd(model: LLMFusedPhoBERT, config: dict) -> torch.opt
     """
     Layer-wise LR Decay cho PhoBERT backbone + LR cao hơn cho fusion heads.
 
-    Lý do dùng LR khác nhau:
-        - PhoBERT backbone: pretrained → LR nhỏ, decay theo layer
-        - LLM projection + FusionMLP: train từ đầu → LR lớn hơn (~10x backbone)
+    v2: Thêm các parameters mới (cross_attn_fusion, phobert_pooling, supcon_proj)
+    vào fusion_params group với fusion_lr.
     """
     training_cfg = config["training"]
     base_lr = training_cfg["learning_rate"]
@@ -157,11 +152,12 @@ def build_optimizer_with_llrd(model: LLMFusedPhoBERT, config: dict) -> torch.opt
             p for n, p in model.backbone.embeddings.named_parameters()
             if (any(nd in n for nd in no_decay)) == decay
         ]
-        groups.append({
-            "params": params,
-            "lr": embed_lr,
-            "weight_decay": 0.0 if decay else weight_decay,
-        })
+        if params:
+            groups.append({
+                "params": params,
+                "lr": embed_lr,
+                "weight_decay": 0.0 if decay else weight_decay,
+            })
 
     # Transformer layers (increasing LR from bottom to top)
     for i, layer in enumerate(model.backbone.encoder.layer):
@@ -171,20 +167,29 @@ def build_optimizer_with_llrd(model: LLMFusedPhoBERT, config: dict) -> torch.opt
                 p for n, p in layer.named_parameters()
                 if (any(nd in n for nd in no_decay)) == decay
             ]
-            groups.append({
-                "params": params,
-                "lr": layer_lr,
-                "weight_decay": 0.0 if decay else weight_decay,
-            })
+            if params:
+                groups.append({
+                    "params": params,
+                    "lr": layer_lr,
+                    "weight_decay": 0.0 if decay else weight_decay,
+                })
 
-    # Fusion heads (LLM projection + FusionMLP) — LR lớn hơn nhiều
+    # Fusion heads — tất cả modules không phải backbone
     fusion_lr = base_lr * fusion_lr_mult
-    # Fusion heads (LLM projection + FusionMLP) dùng weight_decay CAO HƠN backbone
-    # vì chúng train từ đầu (không pretrained) → dễ overfit hơn, cần regularize mạnh.
-    # Backbone đã có inductive bias từ pretraining nên weight_decay thấp hơn là đủ.
     fusion_weight_decay = training_cfg.get("fusion_weight_decay", weight_decay * 2)
-    fusion_params = list(model.llm_proj.parameters()) + list(model.fusion_head.parameters())
-    groups.append({"params": fusion_params, "lr": fusion_lr, "weight_decay": fusion_weight_decay})
+
+    # Collect all non-backbone parameters
+    backbone_param_ids = {id(p) for p in model.backbone.parameters()}
+    fusion_params = [
+        p for p in model.parameters()
+        if id(p) not in backbone_param_ids and p.requires_grad
+    ]
+
+    groups.append({
+        "params": fusion_params,
+        "lr": fusion_lr,
+        "weight_decay": fusion_weight_decay,
+    })
 
     console.print(
         f"  [yellow]LLRD: backbone base LR={base_lr} | "
@@ -194,31 +199,45 @@ def build_optimizer_with_llrd(model: LLMFusedPhoBERT, config: dict) -> torch.opt
     return torch.optim.AdamW(groups)
 
 
+def compute_class_prior(labels: list, num_classes: int = 3) -> list:
+    """
+    Tính class prior probabilities từ training labels.
+    Dùng cho Logit Adjustment.
+    """
+    counter = Counter(labels)
+    total = len(labels)
+    prior = [counter.get(c, 0) / total for c in range(num_classes)]
+    console.print(f"  [dim]Class prior: CLEAN={prior[0]:.3f} | OFFENSIVE={prior[1]:.3f} | HATE={prior[2]:.3f}[/dim]")
+    return prior
+
+
 def train(config: dict, config_path: str = "") -> None:
     training_cfg = config["training"]
     data_cfg = config["data"]
     fusion_cfg = config.get("fusion", {})
     log_cfg = config.get("logging", {})
 
-    # ── Banner xác nhận config đang dùng — tránh lặp lại lỗi "kết quả y hệt
-    # lần trước" do nhầm chạy code/config cũ. In rõ các giá trị quan trọng
-    # ngay từ đầu để kiểm tra bằng mắt trước khi tốn thời gian train.
+    # ── Banner xác nhận config ────────────────────────────────────────────────
     console.print("\n" + "=" * 70)
-    console.print("[bold cyan]CONFIG FINGERPRINT — kiểm tra kỹ trước khi train[/bold cyan]")
+    console.print("[bold cyan]CONFIG FINGERPRINT v2 — kiểm tra kỹ trước khi train[/bold cyan]")
     console.print("=" * 70)
-    console.print(f"  Config file:             {config_path or '(không rõ đường dẫn)'}")
+    console.print(f"  Config file:              {config_path or '(không rõ đường dẫn)'}")
     console.print(f"  num_epochs:               {training_cfg.get('num_epochs')}")
     console.print(f"  batch_size:               {training_cfg.get('batch_size')}")
     console.print(f"  use_weighted_sampler:     {training_cfg.get('use_weighted_sampler')}")
+    console.print(f"  sampler_strength:         {training_cfg.get('sampler_strength')}")
+    console.print(f"  focal_gamma:              {training_cfg.get('focal_gamma')}")
+    console.print(f"  label_smoothing:          {training_cfg.get('label_smoothing')}")
+    console.print(f"  use_supcon:               {training_cfg.get('use_supcon')}")
+    console.print(f"  supcon_weight:            {training_cfg.get('supcon_weight')}")
+    console.print(f"  use_cross_attention:      {fusion_cfg.get('use_cross_attention')}")
+    console.print(f"  use_hybrid_pooling:       {fusion_cfg.get('use_hybrid_pooling')}")
+    console.print(f"  logit_adjustment_tau:     {training_cfg.get('logit_adjustment_tau')}")
     console.print(f"  warmup_ratio:             {training_cfg.get('warmup_ratio')}")
-    console.print(f"  weight_decay:             {training_cfg.get('weight_decay')}")
-    console.print(f"  fusion_weight_decay:      {training_cfg.get('fusion_weight_decay', '(default = weight_decay × 2)')}")
     console.print(f"  early_stopping_patience:  {training_cfg.get('early_stopping_patience')}")
     console.print("=" * 70)
 
-    # Cảnh báo nếu checkpoint cũ tồn tại — best_model.pt cũ KHÔNG bị xóa tự
-    # động, nếu training crash sớm hoặc bị nhầm chạy nhánh code cũ, kết quả
-    # cuối có thể vô tình load lại checkpoint cũ thay vì checkpoint mới.
+    # Cảnh báo nếu checkpoint cũ tồn tại
     ckpt_path = os.path.join(training_cfg["output_dir"], "best_model.pt")
     if os.path.isfile(ckpt_path):
         import time
@@ -230,9 +249,7 @@ def train(config: dict, config_path: str = "") -> None:
             f"  Checkpoint này sẽ bị GHI ĐÈ nếu epoch mới đạt best_f1 cao hơn.\n"
             f"  Nếu muốn chắc chắn train từ đầu sạch, hãy xóa file này trước khi chạy.[/bold yellow]"
         )
-        response_hint = (
-            f"  Gợi ý: mv {ckpt_path} {ckpt_path}.bak_{int(mtime)}"
-        )
+        response_hint = f"  Gợi ý: mv {ckpt_path} {ckpt_path}.bak_{int(mtime)}"
         console.print(f"[dim]{response_hint}[/dim]\n")
 
     set_seed(data_cfg["seed"])
@@ -241,7 +258,7 @@ def train(config: dict, config_path: str = "") -> None:
 
     logger = ExperimentLogger(
         project_name=log_cfg.get("project_name", "TinyPhoBERT"),
-        run_name=log_cfg.get("run_name", "llm-fusion"),
+        run_name=log_cfg.get("run_name", "llm-fusion-v2"),
         log_dir=log_cfg.get("log_dir", "logs/fusion"),
         use_wandb=log_cfg.get("use_wandb", False),
         use_tensorboard=log_cfg.get("use_tensorboard", True),
@@ -274,10 +291,10 @@ def train(config: dict, config_path: str = "") -> None:
             texts, labels, tokenizer, emb_path,
             max_length=training_cfg["max_seq_length"],
         )
-        console.print(f"  {split}: {len(dataset):,} samples | dist={dict(zip(*np.unique(labels, return_counts=True)))}")
+        dist = dict(zip(*np.unique(labels, return_counts=True)))
+        console.print(f"  {split}: {len(dataset):,} samples | dist={dist}")
         return dataset, labels
 
-    import numpy as np
     train_ds, train_labels = load_split("train")
     val_ds, _ = load_split("val")
     test_ds, _ = load_split("test")
@@ -286,30 +303,44 @@ def train(config: dict, config_path: str = "") -> None:
     class_weights = get_class_weights(train_labels, num_classes=config["model"]["num_labels"])
     class_weights_device = class_weights.to(device)
 
+    # Class prior cho Logit Adjustment
+    class_prior = compute_class_prior(train_labels, num_classes=config["model"]["num_labels"])
+
     use_sampler = training_cfg.get("use_weighted_sampler", True)
     train_loader = DataLoader(
         train_ds,
         batch_size=training_cfg["batch_size"],
-        sampler=get_weighted_sampler(train_labels, strength=training_cfg.get("sampler_strength", 0.5)) if use_sampler else None,
+        sampler=get_weighted_sampler(
+            train_labels,
+            strength=training_cfg.get("sampler_strength", 0.7),
+        ) if use_sampler else None,
         shuffle=not use_sampler,
         num_workers=training_cfg.get("dataloader_num_workers", 4),
         pin_memory=(device.type == "cuda"),
     )
-    val_loader = DataLoader(val_ds, batch_size=training_cfg["batch_size"] * 2, shuffle=False,
-                            num_workers=training_cfg.get("dataloader_num_workers", 4))
-    test_loader = DataLoader(test_ds, batch_size=training_cfg["batch_size"] * 2, shuffle=False,
-                             num_workers=training_cfg.get("dataloader_num_workers", 4))
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=training_cfg["batch_size"] * 2,
+        shuffle=False,
+        num_workers=training_cfg.get("dataloader_num_workers", 4),
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=training_cfg["batch_size"] * 2,
+        shuffle=False,
+        num_workers=training_cfg.get("dataloader_num_workers", 4),
+    )
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    console.print(f"\n[bold cyan]Building LLMFusedPhoBERT...[/bold cyan]")
-    model = build_fusion_model_from_config(config)
+    console.print(f"\n[bold cyan]Building LLMFusedPhoBERT v2...[/bold cyan]")
+    model = build_fusion_model_from_config(config, class_prior=class_prior)
     model.class_weights = class_weights_device
     model = model.to(device)
 
     param_info = model.count_parameters()
     console.print(f"  Total params:     [bold green]{param_info['total']:,}[/bold green]")
     console.print(f"  PhoBERT backbone: {param_info['phobert_backbone']:,}")
-    console.print(f"  Fusion heads:     {param_info['fusion_heads']:,} (llm_proj + fusion_mlp)")
+    console.print(f"  Fusion heads:     {param_info['fusion_heads']:,} (all non-backbone)")
 
     # ── Optimizer + Scheduler ─────────────────────────────────────────────────
     use_llrd = training_cfg.get("use_llrd", True)
@@ -342,7 +373,7 @@ def train(config: dict, config_path: str = "") -> None:
     global_step = 0
     history = []
 
-    console.print(f"\n[bold cyan]Training LLMFusedPhoBERT ({training_cfg['num_epochs']} epochs max)...[/bold cyan]\n")
+    console.print(f"\n[bold cyan]Training LLMFusedPhoBERT v2 ({training_cfg['num_epochs']} epochs max)...[/bold cyan]\n")
 
     for epoch in range(1, training_cfg["num_epochs"] + 1):
         current_lr = scheduler.get_last_lr()[0]
@@ -357,18 +388,23 @@ def train(config: dict, config_path: str = "") -> None:
 
         f1_off = val_metrics.get("f1_offensive", 0)
         f1_hate = val_metrics.get("f1_hate", 0)
+        f1_clean = val_metrics.get("f1_clean", 0)
 
         log_dict = {
-            "train/loss": train_metrics["loss"], "train/f1_macro": train_metrics["macro_f1"],
-            "val/loss": val_metrics["loss"], "val/f1_macro": val_metrics["macro_f1"],
-            "val/f1_offensive": f1_off, "val/f1_hate": f1_hate,
+            "train/loss": train_metrics["loss"],
+            "train/f1_macro": train_metrics["macro_f1"],
+            "val/loss": val_metrics["loss"],
+            "val/f1_macro": val_metrics["macro_f1"],
+            "val/f1_clean": f1_clean,
+            "val/f1_offensive": f1_off,
+            "val/f1_hate": f1_hate,
         }
         logger.log(log_dict, step=global_step)
 
         console.print(
             f"  Train: loss={train_metrics['loss']:.4f} | f1_macro={train_metrics['macro_f1']:.4f}\n"
             f"  Val  : loss={val_metrics['loss']:.4f}   | f1_macro={val_metrics['macro_f1']:.4f}\n"
-            f"         f1_off={f1_off:.4f} | f1_hate={f1_hate:.4f}"
+            f"         f1_clean={f1_clean:.4f} | f1_off={f1_off:.4f} | f1_hate={f1_hate:.4f}"
         )
         history.append({"epoch": epoch, **log_dict})
 
@@ -377,11 +413,19 @@ def train(config: dict, config_path: str = "") -> None:
             best_epoch = epoch
             ckpt_path = os.path.join(training_cfg["output_dir"], "best_model.pt")
             torch.save(
-                {"epoch": epoch, "model_state_dict": model.state_dict(),
-                 "val_f1": best_f1, "config": config},
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "val_f1": best_f1,
+                    "config": config,
+                    "class_prior": class_prior,
+                },
                 ckpt_path,
             )
-            console.print(f"  [bold green]✓ Best model saved (Macro-F1={best_f1:.4f} | F1_OFF={f1_off:.4f} | F1_HATE={f1_hate:.4f})[/bold green]")
+            console.print(
+                f"  [bold green]✓ Best model saved "
+                f"(Macro-F1={best_f1:.4f} | F1_OFF={f1_off:.4f} | F1_HATE={f1_hate:.4f})[/bold green]"
+            )
 
         if early_stopping(val_metrics["macro_f1"]):
             console.print(f"\n[bold yellow]Early stopping at epoch {epoch}.[/bold yellow]")
@@ -391,19 +435,21 @@ def train(config: dict, config_path: str = "") -> None:
     with open(os.path.join(training_cfg["output_dir"], "training_history.json"), "w") as f:
         json.dump(history, f, indent=2)
 
-    # ── Final Test Evaluation ──────────────────────────────────────────────────
+    # ── Final Test Evaluation ─────────────────────────────────────────────────
     console.print("\n[bold cyan]Final Test Evaluation...[/bold cyan]")
     ckpt = torch.load(
         os.path.join(training_cfg["output_dir"], "best_model.pt"),
-        map_location=device, weights_only=False,
+        map_location=device,
+        weights_only=False,
     )
     model.load_state_dict(ckpt["model_state_dict"])
     test_metrics, test_labels, test_preds = evaluate(model, test_loader, device, "Test")
 
     print_classification_report(test_labels, test_preds)
 
-    table = Table(title="LLMFusedPhoBERT Test Results")
-    table.add_column("Metric", style="cyan"); table.add_column("Value", style="green")
+    table = Table(title="LLMFusedPhoBERT v2 Test Results")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
     for k, v in test_metrics.items():
         table.add_row(k, f"{v:.4f}")
     console.print(table)
@@ -414,18 +460,19 @@ def train(config: dict, config_path: str = "") -> None:
     result_payload = {
         **test_metrics,
         "best_epoch": best_epoch,
-        "model": "LLMFusedPhoBERT",
+        "model": "LLMFusedPhoBERT_v2",
         "run_timestamp": run_timestamp,
         "config_num_epochs": training_cfg.get("num_epochs"),
         "config_use_weighted_sampler": training_cfg.get("use_weighted_sampler"),
+        "config_focal_gamma": training_cfg.get("focal_gamma"),
+        "config_use_supcon": training_cfg.get("use_supcon"),
+        "config_use_cross_attention": fusion_cfg.get("use_cross_attention"),
+        "config_use_hybrid_pooling": fusion_cfg.get("use_hybrid_pooling"),
     }
 
-    # Lưu file timestamped — tránh nhầm lẫn kết quả run cũ/mới khi xem lại
     timestamped_path = f"results/fusion_results_{run_timestamp}.json"
     with open(timestamped_path, "w") as f:
         json.dump(result_payload, f, indent=2)
-
-    # Lưu thêm bản "latest" cố định tên để dễ tham chiếu trong script khác
     with open("results/fusion_results.json", "w") as f:
         json.dump(result_payload, f, indent=2)
 
@@ -439,9 +486,9 @@ def main():
     parser.add_argument("--config", type=str, default="configs/fusion_config.yaml")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument(
-        "--force_fresh", action="store_true",
-        help="Tự động backup (đổi tên) best_model.pt cũ trước khi train, "
-             "đảm bảo không nhầm lẫn kết quả cũ/mới.",
+        "--force_fresh",
+        action="store_true",
+        help="Tự động backup best_model.pt cũ trước khi train.",
     )
     args = parser.parse_args()
 

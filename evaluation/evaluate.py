@@ -230,12 +230,8 @@ def main():
 
     # Load model
     if args.model_type == "teacher":
-        model = PhoBERTTeacher()
-        ckpt = torch.load(args.model_path, map_location=device)
-        if "model_state_dict" in ckpt:
-            model.load_state_dict(ckpt["model_state_dict"])
-        else:
-            model.load_state_dict(ckpt)
+        model = PhoBERTTeacher.from_pretrained_checkpoint(args.model_path)
+        ckpt = torch.load(args.model_path, map_location=device, weights_only=False)
         model = model.to(device)
         model_name = "PhoBERT Teacher"
     else:

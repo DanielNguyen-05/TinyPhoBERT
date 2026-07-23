@@ -1,0 +1,66 @@
+# Strong teacher baseline. Add one imbalance mechanism only after this baseline
+# has been measured on validation macro-F1.
+model:
+  name: vinai/phobert-large
+  num_labels: 3
+  dropout: 0.15
+  classification_head: multiscale
+  num_mixed_layers: 4
+  cnn_kernel_sizes: [1, 3, 5]
+  cnn_channels: 128
+
+preprocessing:
+  enabled: true
+  lowercase: false
+  remove_url: true
+  normalize_unicode: true
+  reduce_repeat: true
+  apply_teencode: false
+  remove_emoji: false
+  remove_phone: true
+
+# Establish an unaugmented baseline first. EDA can alter the class semantics
+# of short hate/offensive comments and must earn its place through validation.
+augmentation:
+  enabled: false
+
+training:
+  output_dir: checkpoints/teacher_strong
+  num_epochs: 15
+  batch_size: 16
+  max_seq_length: 128
+  learning_rate: 1.0e-5
+  head_lr_multiplier: 5.0
+  weight_decay: 0.01
+  warmup_ratio: 0.06
+  max_grad_norm: 1.0
+  fp16: true
+  dataloader_num_workers: 4
+  early_stopping_patience: 4
+  use_cosine_schedule: true
+
+  use_llrd: true
+  llrd_factor: 0.95
+
+  use_focal_loss: false
+  use_class_weights: false
+  label_smoothing: 0.05
+  use_weighted_sampler: false
+  sampler_strength: 0.5
+  use_supcon: false
+
+data:
+  train_file: data/processed/train.csv
+  val_file: data/processed/val.csv
+  test_file: data/processed/test.csv
+  augmented_dir: data/prepared_teacher_strong
+  text_col: free_text
+  label_col: label_id
+  seed: 42
+
+logging:
+  use_wandb: false
+  use_tensorboard: true
+  project_name: TinyPhoBERT
+  run_name: teacher-strong-seed42
+  log_dir: logs/teacher_strong

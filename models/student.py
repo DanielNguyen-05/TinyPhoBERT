@@ -23,6 +23,68 @@ import torch.nn as nn
 from transformers import RobertaConfig, RobertaModel
 
 
+class MultiScaleHateSpeechHead(nn.Module):
+    """Mix upper layers and capture both global context and local n-grams."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_labels: int,
+        num_mixed_layers: int = 4,
+        cnn_kernel_sizes: Tuple[int, ...] = (1, 3, 5),
+        cnn_channels: int = 128,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        if num_mixed_layers < 1:
+            raise ValueError("num_mixed_layers must be positive")
+        if not cnn_kernel_sizes or any(k < 1 or k % 2 == 0 for k in cnn_kernel_sizes):
+            raise ValueError("cnn_kernel_sizes must contain positive odd integers")
+
+        self.num_mixed_layers = num_mixed_layers
+        self.layer_weights = nn.Parameter(torch.zeros(num_mixed_layers))
+        self.convs = nn.ModuleList([
+            nn.Conv1d(hidden_size, cnn_channels, kernel_size=k, padding=k // 2)
+            for k in cnn_kernel_sizes
+        ])
+
+        combined_size = 2 * hidden_size + len(cnn_kernel_sizes) * cnn_channels
+        self.projection = nn.Linear(combined_size, hidden_size)
+        self.gate = nn.Linear(2 * hidden_size, hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(hidden_size, num_labels)
+
+    def forward(
+        self,
+        hidden_states: Tuple[torch.Tensor, ...],
+        attention_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        available = min(self.num_mixed_layers, len(hidden_states))
+        selected = hidden_states[-available:]
+        weights = torch.softmax(self.layer_weights[-available:], dim=0)
+        sequence = sum(w * h for w, h in zip(weights, selected))
+
+        mask = attention_mask.unsqueeze(-1).to(sequence.dtype)
+        mean_pool = (sequence * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+        cls_pool = sequence[:, 0]
+
+        conv_input = sequence.transpose(1, 2)
+        padding_mask = attention_mask.unsqueeze(1).bool()
+        conv_pools = []
+        for conv in self.convs:
+            features = torch.relu(conv(conv_input))
+            features = features.masked_fill(~padding_mask, torch.finfo(features.dtype).min)
+            conv_pools.append(features.max(dim=2).values)
+
+        local_global = torch.cat([cls_pool, mean_pool, *conv_pools], dim=-1)
+        candidate = torch.nn.functional.gelu(self.projection(local_global))
+        gate = torch.sigmoid(self.gate(torch.cat([cls_pool, candidate], dim=-1)))
+        pooled = self.norm(cls_pool + gate * candidate)
+        pooled = self.dropout(pooled)
+        return self.classifier(pooled), pooled
+
+
 class TinyPhoBERT(nn.Module):
     """
     TinyPhoBERT: Compact student model for Vietnamese Hate Speech Detection.
@@ -56,6 +118,10 @@ class TinyPhoBERT(nn.Module):
         teacher_hidden_size: int = 1024,
         layer_norm_eps: float = 1e-5,
         type_vocab_size: int = 1,
+        classification_head: str = "linear",
+        num_mixed_layers: int = 4,
+        cnn_kernel_sizes: Tuple[int, ...] = (1, 3, 5),
+        cnn_channels: int = 128,
     ) -> None:
         super().__init__()
         self.num_labels = num_labels
@@ -63,6 +129,7 @@ class TinyPhoBERT(nn.Module):
         self.num_layers = num_hidden_layers
         self.num_heads = num_attention_heads
         self.teacher_hidden_size = teacher_hidden_size
+        self.classification_head = classification_head
 
         # Build RoBERTa config (PhoBERT uses RoBERTa architecture)
         # NOTE: attn_implementation="eager" is required for output_attentions=True
@@ -86,9 +153,24 @@ class TinyPhoBERT(nn.Module):
         self.config._attn_implementation = "eager"
         self.backbone = RobertaModel(self.config, add_pooling_layer=False)
 
-        # Classifier head
+        # Classifier head. The multi-scale option is the comparison model:
+        # upper-layer mixing + local CNN features + gated global pooling.
         self.dropout = nn.Dropout(classifier_dropout)
-        self.classifier = nn.Linear(hidden_size, num_labels)
+        if classification_head == "linear":
+            self.classifier = nn.Linear(hidden_size, num_labels)
+            self.multiscale_head = None
+        elif classification_head == "multiscale":
+            self.classifier = None
+            self.multiscale_head = MultiScaleHateSpeechHead(
+                hidden_size=hidden_size,
+                num_labels=num_labels,
+                num_mixed_layers=num_mixed_layers,
+                cnn_kernel_sizes=tuple(cnn_kernel_sizes),
+                cnn_channels=cnn_channels,
+                dropout=classifier_dropout,
+            )
+        else:
+            raise ValueError("classification_head must be 'linear' or 'multiscale'")
 
         # Projection layer: align student hidden states → teacher hidden size
         # Used ONLY during distillation, not inference
@@ -100,8 +182,9 @@ class TinyPhoBERT(nn.Module):
 
     def _init_weights(self) -> None:
         """Initialize classifier and projection with small normal weights."""
-        nn.init.normal_(self.classifier.weight, std=0.02)
-        nn.init.zeros_(self.classifier.bias)
+        if self.classifier is not None:
+            nn.init.normal_(self.classifier.weight, std=0.02)
+            nn.init.zeros_(self.classifier.bias)
         nn.init.normal_(self.hidden_projection.weight, std=0.02)
 
     def init_from_teacher(
@@ -252,14 +335,18 @@ class TinyPhoBERT(nn.Module):
         outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=return_distill_outputs,
+            output_hidden_states=return_distill_outputs or self.multiscale_head is not None,
             output_attentions=return_distill_outputs,
         )
 
-        sequence_output = outputs.last_hidden_state   # (B, T, 384)
-        cls_output = sequence_output[:, 0, :]          # (B, 384)
-        cls_output = self.dropout(cls_output)
-        logits = self.classifier(cls_output)           # (B, 3)
+        sequence_output = outputs.last_hidden_state
+        if self.multiscale_head is not None:
+            logits, cls_output = self.multiscale_head(
+                outputs.hidden_states, attention_mask
+            )
+        else:
+            cls_output = self.dropout(sequence_output[:, 0, :])
+            logits = self.classifier(cls_output)
 
         result = {
             "logits": logits,
@@ -335,4 +422,8 @@ def build_student_from_config(config: dict) -> TinyPhoBERT:
         classifier_dropout=model_cfg.get("classifier_dropout", 0.1),
         teacher_hidden_size=model_cfg.get("teacher_hidden_size", 1024),
         layer_norm_eps=model_cfg.get("layer_norm_eps", 1e-5),
+        classification_head=model_cfg.get("classification_head", "linear"),
+        num_mixed_layers=model_cfg.get("num_mixed_layers", 4),
+        cnn_kernel_sizes=tuple(model_cfg.get("cnn_kernel_sizes", [1, 3, 5])),
+        cnn_channels=model_cfg.get("cnn_channels", 128),
     )

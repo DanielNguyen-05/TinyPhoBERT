@@ -1,13 +1,14 @@
 """
-training/train_teacher.py  [BẢN KHÔI PHỤC — đạt Macro-F1=65.38%]
+training/train_teacher.py  [v3 — đọc từ data đã chuẩn bị sẵn]
 
-Fine-tune PhoBERT-large (Teacher) trên dữ liệu đã chuẩn bị sẵn bởi
-data/prepare_data.py. KHÔNG có SupCon (SupCon là nguyên nhân gây NaN
-và giảm hiệu suất trong các thử nghiệm sau này).
+Fine-tune PhoBERT-large (Teacher) trên dữ liệu đã được chuẩn bị bởi
+data/prepare_data.py (đã preprocess + augment, lưu cố định trên đĩa).
 
-Kết quả tham chiếu đã đạt được với bản này:
-    accuracy=0.8728 | macro_f1=0.6538 | f1_offensive=0.4176 | f1_hate=0.6068
-    best_epoch=22
+KHÁC BIỆT QUAN TRỌNG so với v2:
+    - KHÔNG tự augment/preprocess trong RAM nữa
+    - Đọc trực tiếp từ data/augmented/{train,val,test}.csv
+    - Đảm bảo: mọi lần train đều dùng ĐÚNG 1 bộ dữ liệu cố định,
+      có thể kiểm tra bằng mắt trước khi tốn thời gian train
 
 Quy trình bắt buộc TRƯỚC khi chạy file này:
     python data/prepare_data.py --config configs/teacher_config.yaml
@@ -53,7 +54,7 @@ console = Console()
 
 class EarlyStopping:
     """Dừng training nếu val metric không cải thiện sau `patience` epochs."""
-    def __init__(self, patience: int = 4, min_delta: float = 1e-4, mode: str = "max"):
+    def __init__(self, patience: int = 5, min_delta: float = 1e-4, mode: str = "max"):
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode
@@ -80,15 +81,7 @@ class EarlyStopping:
         return False
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, grad_clip=1.0, fp16=False, scaler=None, fgm=None):
-    """
-    Args:
-        fgm: FGM instance (từ models/fgm.py) hoặc None để tắt adversarial training.
-             Khi bật: sau backward() loss gốc, perturb embedding theo hướng
-             gradient, forward+backward lại trên embedding nhiễu, rồi restore.
-             Gradient của cả 2 lần backward() tích lũy vào cùng .grad trước
-             khi optimizer.step() — model học từ cả input gốc lẫn "khó nhất".
-    """
+def train_epoch(model, dataloader, optimizer, scheduler, device, grad_clip=1.0, fp16=False, scaler=None):
     model.train()
     total_loss = 0.0
     all_preds, all_labels = [], []
@@ -107,21 +100,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, grad_clip=1.0, 
                 outputs = model(input_ids, attention_mask, labels)
                 loss = outputs["loss"]
             scaler.scale(loss).backward()
-
-            if fgm is not None:
-                # QUAN TRỌNG: KHÔNG gọi scaler.unscale_() trước đây — attack()
-                # dùng norm của gradient để tính hướng nhiễu, scale factor tự
-                # triệt tiêu trong phép chia (scaled_grad/norm(scaled_grad) =
-                # real_grad/norm(real_grad)), nên an toàn dùng gradient đã scale.
-                fgm.attack()
-                with autocast():
-                    outputs_adv = model(input_ids, attention_mask, labels)
-                    loss_adv = outputs_adv["loss"]
-                # Cùng scale factor với lần backward() đầu (scaler chỉ update()
-                # 1 lần ở cuối step) → 2 gradient tích lũy nhất quán, an toàn.
-                scaler.scale(loss_adv).backward()
-                fgm.restore()
-
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
@@ -130,14 +108,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, grad_clip=1.0, 
             outputs = model(input_ids, attention_mask, labels)
             loss = outputs["loss"]
             loss.backward()
-
-            if fgm is not None:
-                fgm.attack()
-                outputs_adv = model(input_ids, attention_mask, labels)
-                loss_adv = outputs_adv["loss"]
-                loss_adv.backward()
-                fgm.restore()
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
@@ -180,7 +150,10 @@ def evaluate(model, dataloader, device, split_name="Val"):
 
 
 def load_prepared_data(config: dict):
-    """Đọc dữ liệu ĐÃ ĐƯỢC CHUẨN BỊ SẴN từ data/prepare_data.py."""
+    """
+    Đọc dữ liệu ĐÃ ĐƯỢC CHUẨN BỊ SẴN từ data/prepare_data.py.
+    KHÔNG tự preprocess/augment ở đây nữa.
+    """
     import pandas as pd
 
     data_cfg = config["data"]
@@ -228,6 +201,7 @@ def train(config: dict) -> None:
     console.print("[bold cyan]Loading tokenizer...[/bold cyan]")
     tokenizer = get_teacher_tokenizer(config["model"]["name"])
 
+    # ── Đọc dữ liệu ĐÃ chuẩn bị sẵn (không tự augment nữa) ────────────────────
     train_df, val_df, test_df = load_prepared_data(config)
 
     text_col = config["data"]["text_col"]
@@ -278,26 +252,52 @@ def train(config: dict) -> None:
         num_workers=config["training"].get("dataloader_num_workers", 4),
     )
 
-    # ── Model — KHÔNG có SupCon ───────────────────────────────────────────────
+    # ── Model ─────────────────────────────────────────────────────────────────
     console.print(f"\n[bold cyan]Building Teacher model ({config['model']['name']})...[/bold cyan]")
     use_focal = config["training"].get("use_focal_loss", True)
+    use_class_weights = config["training"].get("use_class_weights", False)
     focal_gamma = config["training"].get("focal_gamma", 2.0)
     label_smoothing = config["training"].get("label_smoothing", 0.1)
+    use_supcon = config["training"].get("use_supcon", False)
+    supcon_proj_dim = config["training"].get("supcon_proj_dim", 256)
 
     model = PhoBERTTeacher(
         model_name=config["model"]["name"],
         num_labels=config["model"]["num_labels"],
         dropout=config["model"]["dropout"],
-        class_weights=class_weights if use_focal else None,
+        class_weights=class_weights if use_class_weights else None,
         use_focal_loss=use_focal,
         focal_gamma=focal_gamma,
         label_smoothing=label_smoothing,
+        use_supcon=use_supcon,
+        supcon_proj_dim=supcon_proj_dim,
+        supcon_weight=config["training"].get("supcon_weight", 0.3),
+        supcon_temperature=config["training"].get("supcon_temperature", 0.07),
+        classification_head=config["model"].get("classification_head", "linear"),
+        num_mixed_layers=config["model"].get("num_mixed_layers", 4),
+        cnn_kernel_sizes=tuple(config["model"].get("cnn_kernel_sizes", [1, 3, 5])),
+        cnn_channels=config["model"].get("cnn_channels", 128),
     ).to(device)
 
     console.print(f"  Teacher params: [bold green]{model.count_parameters():,}[/bold green]")
-    console.print(f"  Loss: {'Focal Loss' if use_focal else 'Weighted CE'} | γ={focal_gamma}")
+    loss_name = "Focal" if use_focal else "Cross-entropy"
+    console.print(
+        f"  Head: {config['model'].get('classification_head', 'linear')} | "
+        f"Loss: {loss_name} | class_weights={use_class_weights} | γ={focal_gamma}"
+    )
+    if use_supcon:
+        supcon_weight = config["training"].get("supcon_weight", 0.3)
+        console.print(
+            f"  [yellow]SupCon: ON[/yellow] | weight={supcon_weight} "
+            f"| proj_dim={supcon_proj_dim} "
+            f"| temperature={config['training'].get('supcon_temperature', 0.07)}"
+        )
+        console.print(
+            "  [yellow]⚠ Đảm bảo use_weighted_sampler=true — SupCon cần đủ "
+            "sample mọi class trong mỗi batch.[/yellow]"
+        )
 
-    # ── Optimizer (LLRD) & Scheduler ──────────────────────────────────────────
+    # ── Optimizer (LLRD optional) & Scheduler ────────────────────────────────
     use_llrd = config["training"].get("use_llrd", False)
     llrd_factor = config["training"].get("llrd_factor", 0.9)
 
@@ -324,15 +324,23 @@ def train(config: dict) -> None:
                                        if any(nd in n for nd in no_decay)],
                             "weight_decay": 0.0, "lr": layer_lr})
 
-        groups.append({"params": [p for n, p in model.classifier.named_parameters()
+        backbone_ids = {id(p) for p in model.backbone.parameters()}
+        head_named_params = [
+            (n, p) for n, p in model.named_parameters()
+            if id(p) not in backbone_ids and p.requires_grad
+        ]
+        head_lr = base_lr * config["training"].get("head_lr_multiplier", 5.0)
+        groups.append({"params": [p for n, p in head_named_params
                                    if not any(nd in n for nd in no_decay)],
-                        "weight_decay": config["training"]["weight_decay"], "lr": base_lr})
-        groups.append({"params": [p for n, p in model.classifier.named_parameters()
+                        "weight_decay": config["training"]["weight_decay"], "lr": head_lr})
+        groups.append({"params": [p for n, p in head_named_params
                                    if any(nd in n for nd in no_decay)],
-                        "weight_decay": 0.0, "lr": base_lr})
+                        "weight_decay": 0.0, "lr": head_lr})
 
         optimizer = torch.optim.AdamW(groups)
-        console.print(f"  [yellow]LLRD enabled: factor={llrd_factor}[/yellow]")
+        console.print(
+            f"  [yellow]LLRD enabled: factor={llrd_factor}, head_lr={head_lr:.2e}[/yellow]"
+        )
     else:
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -354,7 +362,7 @@ def train(config: dict) -> None:
     if fp16:
         console.print("  [yellow]FP16 mixed precision enabled.[/yellow]")
 
-    patience = config["training"].get("early_stopping_patience", 4)
+    patience = config["training"].get("early_stopping_patience", 5)
     early_stopping = EarlyStopping(patience=patience, mode="max")
     console.print(f"  [yellow]Early stopping: patience={patience} epochs[/yellow]")
 
@@ -423,7 +431,10 @@ def train(config: dict) -> None:
 
     # ── Final Test Evaluation ──────────────────────────────────────────────────
     console.print("\n[bold cyan]Final Test Evaluation...[/bold cyan]")
-    ckpt = torch.load(os.path.join(config["training"]["output_dir"], "best_model.pt"), map_location=device, weights_only=False)
+    ckpt = torch.load(
+        os.path.join(config["training"]["output_dir"], "best_model.pt"), 
+        map_location=device,
+        weights_only=False,)
     model.load_state_dict(ckpt["model_state_dict"])
 
     test_metrics, test_labels, test_preds = evaluate(model, test_loader, device, "Test")
@@ -440,10 +451,7 @@ def train(config: dict) -> None:
     results_dir = "results"
     os.makedirs(results_dir, exist_ok=True)
     with open(os.path.join(results_dir, "teacher_results.json"), "w") as f:
-        json.dump({
-            **test_metrics, "best_epoch": best_epoch, "model_name": config["model"]["name"],
-            "augmentation": True, "preprocessing": True,
-        }, f, indent=2)
+        json.dump({**test_metrics, "best_epoch": best_epoch, "model_name": config["model"]["name"]}, f, indent=2)
     console.print(f"Results saved to {results_dir}/teacher_results.json")
 
     logger.finish()

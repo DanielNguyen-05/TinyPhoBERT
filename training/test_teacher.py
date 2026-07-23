@@ -135,6 +135,10 @@ def main():
         use_focal_loss=use_focal,
         focal_gamma=focal_gamma,
         label_smoothing=label_smoothing,
+        classification_head=config["model"].get("classification_head", "linear"),
+        num_mixed_layers=config["model"].get("num_mixed_layers", 4),
+        cnn_kernel_sizes=tuple(config["model"].get("cnn_kernel_sizes", [1, 3, 5])),
+        cnn_channels=config["model"].get("cnn_channels", 128),
     ).to(device)
 
     checkpoint_path = args.checkpoint
