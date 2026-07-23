@@ -158,6 +158,10 @@ def main():
         help="0=strong static ensemble, 1=fully class-aware.",
     )
     parser.add_argument("--weight_step", type=float, default=0.1)
+    parser.add_argument(
+        "--min_class_aware_gain", type=float, default=0.002,
+        help="Minimum paired CV Macro-F1 gain required over calibrated static.",
+    )
     parser.add_argument("--selection_folds", type=int, default=3)
     parser.add_argument("--selection_repeats", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
@@ -181,6 +185,14 @@ def main():
         raise ValueError("--class_balance_power_grid values must be in [0, 1]")
     if any(not 0.0 <= value <= 1.0 for value in args.blend_grid):
         raise ValueError("--blend_grid values must be in [0, 1]")
+    if 0.0 not in args.blend_grid or not any(
+        value > 0.0 for value in args.blend_grid
+    ):
+        raise ValueError(
+            "--blend_grid must include 0 and at least one positive value"
+        )
+    if args.min_class_aware_gain < 0:
+        raise ValueError("--min_class_aware_gain must be non-negative")
 
     val_probs, val_labels, val_ids = load_split(args.model_dirs, "val")
     test_probs, test_labels, test_ids = load_split(args.model_dirs, "test")
@@ -212,6 +224,9 @@ def main():
             ]
         )
         fit_calibrated = calibrate_stack(fit_probs, fold_temperatures)
+        holdout_calibrated = calibrate_stack(
+            holdout_probs, fold_temperatures
+        )
         raw_anchor, raw_fit_score = fit_static_macro_f1(
             fit_probs, fit_labels, args.weight_step
         )
@@ -220,7 +235,9 @@ def main():
         )
         raw_fold_scores.append(raw_fit_score)
         calibrated_fold_scores.append(calibrated_fit_score)
-        raw_holdout = static_predict(holdout_probs, raw_anchor)
+        calibrated_static_holdout = static_predict(
+            holdout_calibrated, calibrated_anchor
+        )
         for regularization in args.regularization_grid:
             for balance_power in args.class_balance_power_grid:
                 candidate_model = fit_class_aware_ensemble(
@@ -237,7 +254,7 @@ def main():
                 for blend in args.blend_grid:
                     blended = (
                         blend * class_aware_holdout
-                        + (1.0 - blend) * raw_holdout
+                        + (1.0 - blend) * calibrated_static_holdout
                     )
                     candidate_scores[
                         (regularization, balance_power, blend)
@@ -259,13 +276,44 @@ def main():
             "cv_macro_f1_std": float(np.std(scores)),
             "fold_scores": [float(score) for score in scores],
         })
-    best_config = max(
-        candidates,
+    static_config = max(
+        (
+            candidate for candidate in candidates
+            if candidate["class_aware_blend"] == 0.0
+        ),
         key=lambda item: (
             item["cv_macro_f1_mean"],
             -item["cv_macro_f1_std"],
         ),
     )
+    adaptive_candidates = [
+        candidate for candidate in candidates
+        if candidate["class_aware_blend"] > 0.0
+    ]
+    best_adaptive = max(
+        adaptive_candidates,
+        key=lambda item: (
+            item["cv_macro_f1_mean"],
+            -item["cv_macro_f1_std"],
+        ),
+    )
+    paired_gains = np.asarray(best_adaptive["fold_scores"]) - np.asarray(
+        static_config["fold_scores"]
+    )
+    gain_standard_error = (
+        float(paired_gains.std(ddof=1) / np.sqrt(len(paired_gains)))
+        if len(paired_gains) > 1 else 0.0
+    )
+    required_gain = max(
+        args.min_class_aware_gain, 1.96 * gain_standard_error
+    )
+    observed_gain = float(paired_gains.mean())
+    if observed_gain >= required_gain:
+        best_config = best_adaptive
+        selection_reason = "class-aware gain passed paired-CV threshold"
+    else:
+        best_config = static_config
+        selection_reason = "fallback to calibrated static (gain not significant)"
     best_score = best_config["cv_macro_f1_mean"]
 
     # Refit all calibration/fusion parameters on all validation data.
@@ -276,6 +324,7 @@ def main():
         ]
     )
     val_calibrated = calibrate_stack(val_probs, final_temperatures)
+    test_calibrated = calibrate_stack(test_probs, final_temperatures)
     raw_anchor, raw_val_score = fit_static_macro_f1(
         val_probs, val_labels, args.weight_step
     )
@@ -293,13 +342,15 @@ def main():
     blend = best_config["class_aware_blend"]
     val_class_aware = model.predict_proba(val_probs)
     test_class_aware = model.predict_proba(test_probs)
-    val_static = static_predict(val_probs, raw_anchor)
-    test_static = static_predict(test_probs, raw_anchor)
+    val_static = static_predict(val_calibrated, calibrated_anchor)
+    test_static = static_predict(test_calibrated, calibrated_anchor)
+    test_raw_static = static_predict(test_probs, raw_anchor)
     val_fused = blend * val_class_aware + (1.0 - blend) * val_static
     test_fused = blend * test_class_aware + (1.0 - blend) * test_static
     val_metrics = metric_dict(val_labels, val_fused)
     test_metrics = metric_dict(test_labels, test_fused)
     static_test_metrics = metric_dict(test_labels, test_static)
+    raw_static_test_metrics = metric_dict(test_labels, test_raw_static)
     class_aware_test_metrics = metric_dict(test_labels, test_class_aware)
     individual_test = {
         name: metric_dict(test_labels, test_probs[:, idx])
@@ -322,7 +373,10 @@ def main():
     )
     if train_probs is not None and not args.no_export_train:
         train_class_aware = model.predict_proba(train_probs)
-        train_static = static_predict(train_probs, raw_anchor)
+        train_calibrated = calibrate_stack(train_probs, final_temperatures)
+        train_static = static_predict(
+            train_calibrated, calibrated_anchor
+        )
         train_fused = blend * train_class_aware + (1.0 - blend) * train_static
         np.save(output_dir / "train_probs.npy", train_fused.astype(np.float32))
         np.save(output_dir / "train_labels.npy", train_labels)
@@ -359,6 +413,15 @@ def main():
                 ]
             },
             "selected_cv_macro_f1": best_score,
+            "best_adaptive_cv_macro_f1": best_adaptive[
+                "cv_macro_f1_mean"
+            ],
+            "calibrated_static_cv_macro_f1": static_config[
+                "cv_macro_f1_mean"
+            ],
+            "paired_adaptive_gain": observed_gain,
+            "required_gain": required_gain,
+            "selection_reason": selection_reason,
         },
         "static_raw_weights": dict(zip(names, raw_anchor.tolist())),
         "static_raw_val_macro_f1": raw_val_score,
@@ -370,6 +433,7 @@ def main():
         "val_metrics_refit": val_metrics,
         "test_metrics": test_metrics,
         "static_test_metrics": static_test_metrics,
+        "raw_static_test_metrics": raw_static_test_metrics,
         "unblended_class_aware_test_metrics": class_aware_test_metrics,
         "individual_test_metrics": individual_test,
         "train_targets_exported": exported_train,
@@ -381,7 +445,7 @@ def main():
     table = Table(title="Calibrated Class-Aware Ensemble")
     table.add_column("Metric")
     table.add_column("VAL selected")
-    table.add_column("TEST static")
+    table.add_column("TEST calibrated static")
     table.add_column("TEST class-aware")
     table.add_column("TEST selected")
     for key in ["accuracy", "macro_f1", "f1_clean", "f1_offensive", "f1_hate"]:
@@ -400,7 +464,7 @@ def main():
         "Selected: "
         f"lambda={best_config['regularization']}, "
         f"balance_power={best_config['class_balance_power']}, "
-        f"class_aware_blend={blend}"
+        f"class_aware_blend={blend} | {selection_reason}"
     )
     for class_idx, class_name in enumerate(LABEL_NAMES):
         weights = ", ".join(
