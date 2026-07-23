@@ -114,7 +114,8 @@ bash experiments/run_all.sh
 ### Calibrated class-aware ensemble → DAMS-TinyPhoBERT
 
 Fit temperatures and a regularized expert weight for every output class. The
-regularization value is selected on an internal stratified VAL holdout; the
+regularization, class-balance strength, and blend with the strong static
+ensemble are selected by repeated stratified cross-validation inside VAL; the
 model is then refit on all VAL data and TEST is evaluated once.
 
 ```bash
@@ -137,12 +138,37 @@ python training/train_moe_distill.py \
   --config configs/class_aware_distillation_config.yaml \
   --student_config configs/comparison_student_config.yaml \
   --init_teacher_checkpoint checkpoints/teacher_strong/best_model.pt \
+  --temperature 2.0 --alpha 0.5 \
   --output_dir checkpoints/dams_multiteacher
 ```
 
-For a publishable experiment, generate each expert's `train_probs.npy` with
-out-of-fold (OOF) inference. In-sample train probabilities are supported for
-experimentation but are optimistic and must not be described as OOF.
+Treat `--use_class_weights --class_weight_power 0.5` as a separate ablation;
+it can improve minority recall but may reduce precision.
+
+For the full DAMS variant, add representation anchoring from the strongest
+PhoBERT teacher (reduce batch size if GPU memory is limited):
+
+```bash
+python training/train_moe_distill.py \
+  --moe_teacher_dir checkpoints/class_aware_ensemble \
+  --config configs/class_aware_distillation_config.yaml \
+  --student_config configs/comparison_student_config.yaml \
+  --init_teacher_checkpoint checkpoints/teacher_strong/best_model.pt \
+  --hidden_kd_weight 0.1 --batch_size 16 \
+  --output_dir checkpoints/dams_multiteacher_hidden
+```
+
+Optionally calibrate the compressed student's decision biases on VAL and apply
+the frozen biases once to TEST:
+
+```bash
+python evaluation/calibrate_class_bias.py \
+  --model_dir checkpoints/dams_multiteacher
+```
+
+In-sample train probabilities are valid for conventional KD, but they must not
+be described as OOF. Use OOF expert probabilities for leakage-free stacking
+claims and to make train-target confidence better match held-out inference.
 
 ---
 

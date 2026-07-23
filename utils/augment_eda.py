@@ -309,6 +309,10 @@ def augment_minority_classes(
                 if aug_text.strip():  # Only add non-empty texts
                     new_row = sample.copy()
                     new_row[text_col] = aug_text
+                    if "sample_id" in new_row.index:
+                        new_row["sample_id"] = (
+                            f"{sample['sample_id']}:aug:{generated:08d}"
+                        )
                     new_rows.append(new_row)
                     generated += 1
 

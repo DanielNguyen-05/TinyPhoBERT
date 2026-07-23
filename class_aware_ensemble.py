@@ -1,13 +1,13 @@
 """Calibrated class-aware heterogeneous ensemble.
 
-The ensemble operates in log-probability space:
+The default ensemble operates in arithmetic probability space:
 
-    z_c = sum_m softmax(A[:, c])_m * log p_m(c) + b_c
+    z_c = log(sum_m softmax(A[:, c])_m * p_m(c)) + b_c
     p(y=c) = softmax(z)_c
 
 Each class therefore learns a separate convex combination of experts.  The
-regularizer keeps those combinations close to a shared (class-agnostic)
-mixture, which is important when minority validation classes are small.
+regularizer keeps those combinations close to a strong class-agnostic
+anchor, which is important when minority validation classes are small.
 """
 
 from dataclasses import dataclass
@@ -76,6 +76,7 @@ class ClassAwareEnsemble:
     class_weights: np.ndarray
     class_bias: np.ndarray
     regularization: float = 0.0
+    pooling: str = "linear"
 
     def transform_experts(self, expert_probs: np.ndarray) -> np.ndarray:
         probs = validate_expert_probs(expert_probs)
@@ -95,10 +96,16 @@ class ClassAwareEnsemble:
             raise ValueError(
                 f"Expected weights shape {probs.shape[1:]}, got {self.class_weights.shape}"
             )
-        scores = (
-            self.class_weights[None, :, :]
-            * np.log(np.clip(probs, EPS, 1.0))
-        ).sum(axis=1)
+        if self.pooling == "linear":
+            pooled = (self.class_weights[None, :, :] * probs).sum(axis=1)
+            scores = np.log(np.clip(pooled, EPS, 1.0))
+        elif self.pooling == "log":
+            scores = (
+                self.class_weights[None, :, :]
+                * np.log(np.clip(probs, EPS, 1.0))
+            ).sum(axis=1)
+        else:
+            raise ValueError("pooling must be 'linear' or 'log'")
         scores += self.class_bias[None, :]
         return _softmax(scores, axis=1)
 
@@ -108,7 +115,12 @@ class ClassAwareEnsemble:
             "class_weights": self.class_weights.tolist(),
             "class_bias": self.class_bias.tolist(),
             "regularization": float(self.regularization),
-            "formula": "softmax(sum_m w[m,c] * log(calibrated_p[m,c]) + bias[c])",
+            "pooling": self.pooling,
+            "formula": (
+                "softmax(log(sum_m w[m,c] * calibrated_p[m,c]) + bias[c])"
+                if self.pooling == "linear"
+                else "softmax(sum_m w[m,c] * log(calibrated_p[m,c]) + bias[c])"
+            ),
         }
 
 
@@ -117,7 +129,9 @@ def fit_class_aware_ensemble(
     labels: np.ndarray,
     temperatures: Optional[np.ndarray] = None,
     regularization: float = 0.1,
-    class_balanced: bool = True,
+    class_balance_power: float = 0.5,
+    anchor_weights: Optional[np.ndarray] = None,
+    pooling: str = "linear",
     maxiter: int = 1000,
 ) -> ClassAwareEnsemble:
     """Fit non-negative, per-class expert weights and class biases."""
@@ -128,6 +142,10 @@ def fit_class_aware_ensemble(
         raise ValueError("labels shape does not match expert_probs")
     if labels.min() < 0 or labels.max() >= n_classes:
         raise ValueError("labels are outside the probability class range")
+    if not 0.0 <= class_balance_power <= 1.0:
+        raise ValueError("class_balance_power must be in [0, 1]")
+    if pooling not in {"linear", "log"}:
+        raise ValueError("pooling must be 'linear' or 'log'")
 
     if temperatures is None:
         temperatures = np.array(
@@ -141,14 +159,22 @@ def fit_class_aware_ensemble(
         ],
         axis=1,
     )
-    log_probs = np.log(np.clip(calibrated, EPS, 1.0))
-
     sample_weights = np.ones(n_samples, dtype=np.float64)
-    if class_balanced:
+    if class_balance_power > 0:
         counts = np.bincount(labels, minlength=n_classes).astype(np.float64)
-        class_weights = n_samples / (n_classes * np.maximum(counts, 1.0))
+        class_weights = (
+            n_samples / (n_classes * np.maximum(counts, 1.0))
+        ) ** class_balance_power
         sample_weights = class_weights[labels]
         sample_weights /= sample_weights.mean()
+
+    if anchor_weights is None:
+        anchor_weights = np.full(n_experts, 1.0 / n_experts)
+    anchor_weights = np.asarray(anchor_weights, dtype=np.float64)
+    if anchor_weights.shape != (n_experts,) or (anchor_weights < 0).any():
+        raise ValueError("anchor_weights must be non-negative with shape [experts]")
+    anchor_weights = np.clip(anchor_weights, 1e-6, None)
+    anchor_weights /= anchor_weights.sum()
 
     def unpack(theta: np.ndarray):
         raw = theta[: n_experts * n_classes].reshape(n_experts, n_classes)
@@ -159,23 +185,31 @@ def fit_class_aware_ensemble(
 
     def objective(theta: np.ndarray) -> float:
         weights, bias = unpack(theta)
-        scores = (weights[None, :, :] * log_probs).sum(axis=1) + bias[None, :]
+        if pooling == "linear":
+            pooled = (weights[None, :, :] * calibrated).sum(axis=1)
+            scores = np.log(np.clip(pooled, EPS, 1.0)) + bias[None, :]
+        else:
+            log_probs = np.log(np.clip(calibrated, EPS, 1.0))
+            scores = (
+                weights[None, :, :] * log_probs
+            ).sum(axis=1) + bias[None, :]
         final_probs = _softmax(scores, axis=1)
         nll = -np.log(
             np.clip(final_probs[np.arange(n_samples), labels], EPS, 1.0)
         )
         loss = float(np.average(nll, weights=sample_weights))
-        shared = weights.mean(axis=1, keepdims=True)
         # Biases can otherwise become a post-hoc threshold search on a small
         # minority holdout, so regularize them together with expert weights.
         penalty = float(
-            np.square(weights - shared).mean() + 0.1 * np.square(bias).mean()
+            np.square(weights - anchor_weights[:, None]).mean()
+            + 0.1 * np.square(bias).mean()
         )
         return loss + regularization * penalty
 
+    initial_raw = np.log(anchor_weights)[:, None].repeat(n_classes, axis=1)
     result = minimize(
         objective,
-        x0=np.zeros(n_experts * n_classes + n_classes),
+        x0=np.concatenate([initial_raw.ravel(), np.zeros(n_classes)]),
         method="L-BFGS-B",
         options={"maxiter": maxiter, "ftol": 1e-10},
     )
@@ -187,4 +221,5 @@ def fit_class_aware_ensemble(
         class_weights=fitted_weights,
         class_bias=fitted_bias,
         regularization=regularization,
+        pooling=pooling,
     )

@@ -183,6 +183,12 @@ class TinyPhoBERT(nn.Module):
             student_embeddings.position_embeddings.weight.copy_(
                 teacher_embeddings.position_embeddings.weight[:, :student_width]
             )
+            student_embeddings.token_type_embeddings.weight.copy_(
+                teacher_embeddings.token_type_embeddings.weight[
+                    : student_embeddings.token_type_embeddings.weight.shape[0],
+                    :student_width,
+                ]
+            )
             student_embeddings.LayerNorm.weight.copy_(
                 teacher_embeddings.LayerNorm.weight[:student_width]
             )
@@ -250,14 +256,17 @@ class TinyPhoBERT(nn.Module):
         attention_mask: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         return_distill_outputs: bool = False,
+        return_attentions: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
+        if return_attentions is None:
+            return_attentions = return_distill_outputs
         outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=(
                 return_distill_outputs or self.multiscale_head is not None
             ),
-            output_attentions=return_distill_outputs,
+            output_attentions=return_attentions,
         )
         if self.multiscale_head is not None:
             logits, pooled_output = self.multiscale_head(

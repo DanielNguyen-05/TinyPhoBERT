@@ -102,6 +102,8 @@ def build_teacher_and_loaders(args, config, device):
             df[label_col].astype(int).tolist(),
             tokenizer, max_length=max_len,
         )
+        if "sample_id" in df.columns:
+            datasets[name].sample_ids = df["sample_id"].astype(str).to_numpy()
 
     model = PhoBERTTeacher.from_pretrained_checkpoint(args.checkpoint).to(device)
 
@@ -146,6 +148,8 @@ def build_qwen_and_loaders(args, config, device):
             df[label_col].astype(int).tolist(),
             tokenizer, max_len,
         )
+        if "sample_id" in df.columns:
+            datasets[name].sample_ids = df["sample_id"].astype(str).to_numpy()
 
     return model, datasets, extract_probs_qwen
 
@@ -184,6 +188,11 @@ def main():
 
         np.save(os.path.join(args.output_dir, f"{split_name}_probs.npy"), probs)
         np.save(os.path.join(args.output_dir, f"{split_name}_labels.npy"), labels)
+        if hasattr(dataset, "sample_ids"):
+            np.save(
+                os.path.join(args.output_dir, f"{split_name}_sample_ids.npy"),
+                dataset.sample_ids,
+            )
         console.print(f"  Saved: {args.output_dir}/{split_name}_probs.npy | shape={probs.shape}")
 
     console.print("\n[bold green]Done![/bold green] Đủ train/val/test probs cho Gating Network.")

@@ -64,6 +64,13 @@ def prepare_data(config: dict, apply_preprocess: bool = True, apply_augment: boo
     test_df = pd.read_csv(data_cfg["test_file"])
 
     for name, df in [("train", train_df), ("val", val_df), ("test", test_df)]:
+        if "sample_id" not in df.columns:
+            # Backward-compatible stable identity for prepared variants made
+            # from the same canonical processed split.
+            df.insert(
+                0, "sample_id",
+                [f"{name}:{row_idx:08d}" for row_idx in range(len(df))],
+            )
         dist = df[label_col].value_counts().to_dict()
         print(f"  {name}: {len(df):,} samples | dist={dist}")
 

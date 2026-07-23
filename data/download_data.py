@@ -183,6 +183,9 @@ def preprocess() -> None:
             print(f"  [Warning] Dùng cột cuối làm label: '{label_col}'")
 
         out = pd.DataFrame()
+        out["sample_id"] = [
+            f"{split}:{row_idx:08d}" for row_idx in range(len(df))
+        ]
         out["free_text"] = df[text_col].astype(str).str.strip()
 
         # Map labels → int

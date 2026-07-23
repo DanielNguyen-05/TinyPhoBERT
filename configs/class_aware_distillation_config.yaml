@@ -2,10 +2,25 @@
 teacher:
   model_name: vinai/phobert-large
 
+distillation:
+  temperature: 2.0
+  alpha: 0.5
+  focal_gamma: 1.0
+  label_smoothing: 0.05
+
+training:
+  num_epochs: 30
+  batch_size: 32
+  max_seq_length: 128
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  dataloader_num_workers: 4
+  early_stopping_patience: 8
+
 data:
   train_file: data/prepared_teacher_strong/train.csv
   val_file: data/prepared_teacher_strong/val.csv
   test_file: data/prepared_teacher_strong/test.csv
   text_col: free_text
   label_col: label_id
-
