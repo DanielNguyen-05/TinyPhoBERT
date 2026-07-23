@@ -1,0 +1,11 @@
+# Data/tokenizer source for distillation from the fused multi-teacher artifact.
+teacher:
+  model_name: vinai/phobert-large
+
+data:
+  train_file: data/prepared_teacher_strong/train.csv
+  val_file: data/prepared_teacher_strong/val.csv
+  test_file: data/prepared_teacher_strong/test.csv
+  text_col: free_text
+  label_col: label_id
+
