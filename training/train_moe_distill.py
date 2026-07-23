@@ -33,7 +33,7 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models.student import TinyPhoBERT
+from models.student import build_student_from_config
 
 console = Console()
 LABEL_NAMES = ["CLEAN", "OFFENSIVE", "HATE"]
@@ -143,7 +143,9 @@ def train(args, config):
     test_loader = DataLoader(datasets["test"], batch_size=args.batch_size * 2, shuffle=False)
 
     console.print(f"[bold cyan]Building TinyPhoBERT student...[/bold cyan]")
-    model = TinyPhoBERT(num_labels=3).to(device)
+    with open(args.student_config) as f:
+        student_config = yaml.safe_load(f)
+    model = build_student_from_config(student_config).to(device)
     console.print(f"  Student params: {model.count_parameters():,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -197,7 +199,8 @@ def train(args, config):
 
         if val_metrics["macro_f1"] > best_f1:
             best_f1, best_epoch = val_metrics["macro_f1"], epoch
-            torch.save({"model_state_dict": model.state_dict(), "val_f1": best_f1, "epoch": epoch},
+            torch.save({"model_state_dict": model.state_dict(), "val_f1": best_f1,
+                        "epoch": epoch, "student_config": student_config},
                        os.path.join(args.output_dir, "best_model.pt"))
             console.print(f"  [bold green]✓ Best model saved (Macro-F1={best_f1:.4f})[/bold green]")
 
@@ -240,6 +243,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--moe_teacher_dir", type=str, required=True)
     parser.add_argument("--config", type=str, default="configs/teacher_config.yaml")
+    parser.add_argument(
+        "--student_config", type=str,
+        default="configs/comparison_student_config.yaml",
+    )
     parser.add_argument("--output_dir", type=str, default="checkpoints/tinyphobert_moe_distilled")
     parser.add_argument("--num_epochs", type=int, default=40)
     parser.add_argument("--batch_size", type=int, default=32)

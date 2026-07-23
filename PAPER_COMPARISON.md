@@ -105,5 +105,5 @@ python evaluation/evaluate.py \
   --model_type student \
   --model_path checkpoints/comparison/DAMS-TinyPhoBERT/best_model.pt \
   --config_path configs/comparison_student_config.yaml \
-  --test_file data/augmented/test.csv
+  --test_file data/prepared_teacher_strong/test.csv
 ```

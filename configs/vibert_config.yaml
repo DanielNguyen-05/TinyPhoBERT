@@ -61,7 +61,7 @@ data:
   train_file: "data/processed/train.csv"
   val_file: "data/processed/val.csv"
   test_file: "data/processed/test.csv"
-  augmented_dir: "data/augmented"
+  augmented_dir: "data/prepared_vibert"
   text_col: "free_text"
   label_col: "label_id"
   seed: 42

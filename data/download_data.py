@@ -145,13 +145,24 @@ def preprocess() -> None:
         if full_df is None:
             print("[Error] Không tìm thấy dữ liệu train!")
             sys.exit(1)
-        full_df = full_df.sample(frac=1, random_state=42).reset_index(drop=True)
-        n = len(full_df)
-        n_train = int(0.8 * n)
-        n_val = int(0.1 * n)
-        all_dfs["train"] = full_df.iloc[:n_train]
-        all_dfs["val"]   = full_df.iloc[n_train : n_train + n_val]
-        all_dfs["test"]  = full_df.iloc[n_train + n_val :]
+        from sklearn.model_selection import train_test_split
+        label_col = next(
+            (c for c in ["label_id", "label", "Label", "labels", "hate_speech_label"]
+             if c in full_df.columns),
+            None,
+        )
+        stratify = full_df[label_col] if label_col is not None else None
+        train_df, remainder = train_test_split(
+            full_df, test_size=0.2, random_state=42, stratify=stratify
+        )
+        remainder_stratify = remainder[label_col] if label_col is not None else None
+        val_df, test_df = train_test_split(
+            remainder, test_size=0.5, random_state=42,
+            stratify=remainder_stratify,
+        )
+        all_dfs["train"] = train_df.reset_index(drop=True)
+        all_dfs["val"] = val_df.reset_index(drop=True)
+        all_dfs["test"] = test_df.reset_index(drop=True)
         print(f"  Train: {len(all_dfs['train']):,} | Val: {len(all_dfs['val']):,} | Test: {len(all_dfs['test']):,}")
 
     # ── Chuẩn hoá cột ──────────────────────────────────────────────────────

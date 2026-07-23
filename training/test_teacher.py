@@ -89,10 +89,11 @@ def main():
 
     tokenizer = get_teacher_tokenizer(config["model"]["name"])
 
+    prepared_dir = Path(config["data"].get("augmented_dir", "data/augmented"))
     train_df, val_df, test_df = load_vihsd_from_csv(
-        train_path=config["data"]["train_file"],
-        val_path=config["data"]["val_file"],
-        test_path=config["data"]["test_file"],
+        train_path=str(prepared_dir / "train.csv"),
+        val_path=str(prepared_dir / "val.csv"),
+        test_path=str(prepared_dir / "test.csv"),
         text_col=config["data"]["text_col"],
         label_col=config["data"]["label_col"],
     )

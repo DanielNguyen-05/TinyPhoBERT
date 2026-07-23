@@ -55,6 +55,11 @@ def main():
     output_dir = args.output_dir or os.path.dirname(args.checkpoint)
     os.makedirs(output_dir, exist_ok=True)
 
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    if isinstance(ckpt, dict) and ckpt.get("config"):
+        config = ckpt["config"]
+        console.print("[cyan]Using the training config embedded in the checkpoint.[/cyan]")
+
     console.print("[bold cyan]Loading tokenizer and data...[/bold cyan]")
     tokenizer = get_teacher_tokenizer(config["model"]["name"])
 
@@ -80,32 +85,10 @@ def main():
     console.print(f"[bold cyan]Loading Teacher checkpoint: {args.checkpoint}[/bold cyan]")
     console.print(f"  model_name trong config: [yellow]{config['model']['name']}[/yellow]")
 
-    model = PhoBERTTeacher(
-        model_name=config["model"]["name"],
-        num_labels=config["model"]["num_labels"],
-        dropout=config["model"].get("dropout", 0.1),
-    )
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    state_dict = ckpt.get("model_state_dict", ckpt)
-
-    # ── CHẨN ĐOÁN: in rõ key nào KHÔNG load được ────────────────────────────
-    result = model.load_state_dict(state_dict, strict=False)
+    model = PhoBERTTeacher.from_pretrained_checkpoint(args.checkpoint)
     console.print(f"\n[bold]=== LOAD_STATE_DICT DIAGNOSTIC ===[/bold]")
-    console.print(f"  Missing keys ({len(result.missing_keys)}): {result.missing_keys[:10]}{'...' if len(result.missing_keys) > 10 else ''}")
-    console.print(f"  Unexpected keys ({len(result.unexpected_keys)}): {result.unexpected_keys[:10]}{'...' if len(result.unexpected_keys) > 10 else ''}")
-
-    backbone_missing = [k for k in result.missing_keys if "backbone" in k]
-    classifier_missing = [k for k in result.missing_keys if "classifier" in k]
-    if backbone_missing or classifier_missing:
-        console.print(
-            f"\n[bold red]✗ NGHIÊM TRỌNG: backbone hoặc classifier weights KHÔNG load được!\n"
-            f"  backbone missing: {len(backbone_missing)} keys\n"
-            f"  classifier missing: {len(classifier_missing)} keys\n"
-            f"  → Model đang chạy với trọng số GẦN NHƯ NGẪU NHIÊN.\n"
-            f"  → Đây chính là lý do accuracy=0.12 (tệ hơn random).[/bold red]\n"
-        )
-    else:
-        console.print("[bold green]  ✓ Backbone + classifier load đầy đủ, không có key quan trọng bị thiếu.[/bold green]\n")
+    console.print(f"  Reconstructed head: {model.classification_head}")
+    console.print("[bold green]  ✓ Architecture reconstructed from checkpoint config.[/bold green]\n")
 
     if "config" in ckpt:
         ckpt_model_name = ckpt["config"].get("model", {}).get("name", "?")

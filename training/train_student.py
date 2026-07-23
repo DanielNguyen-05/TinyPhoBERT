@@ -249,12 +249,11 @@ def train(config: dict, run_name: Optional[str] = None) -> dict:
         from transformers import AutoModelForSequenceClassification
         teacher = PhoBERTTeacher(model_name=teacher_path)
     else:
-        console.print(
-            f"[yellow]Warning: Teacher checkpoint not found at '{teacher_path}'. "
-            "Loading fresh PhoBERT-base (results will be suboptimal). "
-            "Please run training/train_teacher.py first.[/yellow]"
+        raise FileNotFoundError(
+            f"Fine-tuned teacher checkpoint not found at '{teacher_path}'. "
+            "Refusing to distill from a fresh, random classification head. "
+            "Train the teacher first."
         )
-        teacher = PhoBERTTeacher("vinai/phobert-base")
 
     teacher.freeze()
     teacher_params = teacher.count_parameters()

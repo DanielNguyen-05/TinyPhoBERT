@@ -80,6 +80,11 @@ def build_teacher_and_loaders(args, config, device):
     from models.teacher import PhoBERTTeacher, get_teacher_tokenizer
     from utils.data_utils import HateSpeechDataset
 
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    if isinstance(ckpt, dict) and ckpt.get("config"):
+        config = ckpt["config"]
+        console.print("[cyan]Using the training config embedded in the checkpoint.[/cyan]")
+
     tokenizer = get_teacher_tokenizer(config["model"]["name"])
     text_col = config["data"]["text_col"]
     label_col = config["data"]["label_col"]
@@ -98,17 +103,7 @@ def build_teacher_and_loaders(args, config, device):
             tokenizer, max_length=max_len,
         )
 
-    model = PhoBERTTeacher(
-        model_name=config["model"]["name"],
-        num_labels=config["model"]["num_labels"],
-        dropout=config["model"].get("dropout", 0.1),
-    )
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    state_dict = ckpt.get("model_state_dict", ckpt)
-    result = model.load_state_dict(state_dict, strict=False)
-    if any("backbone" in k or "classifier" in k for k in result.missing_keys):
-        console.print(f"[bold red]✗ CẢNH BÁO: thiếu key quan trọng: {result.missing_keys}[/bold red]")
-    model = model.to(device)
+    model = PhoBERTTeacher.from_pretrained_checkpoint(args.checkpoint).to(device)
 
     return model, datasets, extract_probs_teacher
 

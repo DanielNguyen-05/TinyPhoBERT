@@ -27,6 +27,23 @@ console = Console()
 LABEL_NAMES = ["CLEAN", "OFFENSIVE", "HATE"]
 
 
+def temperature_scale_probs(probs: np.ndarray, temperature: float) -> np.ndarray:
+    logits = np.log(np.clip(probs, 1e-12, 1.0)) / temperature
+    logits -= logits.max(axis=1, keepdims=True)
+    exp_logits = np.exp(logits)
+    return exp_logits / exp_logits.sum(axis=1, keepdims=True)
+
+
+def fit_temperature(probs: np.ndarray, labels: np.ndarray) -> float:
+    best_t, best_nll = 1.0, float("inf")
+    for temperature in np.arange(0.5, 3.01, 0.05):
+        calibrated = temperature_scale_probs(probs, float(temperature))
+        nll = -np.log(np.clip(calibrated[np.arange(len(labels)), labels], 1e-12, 1.0)).mean()
+        if nll < best_nll:
+            best_t, best_nll = float(temperature), float(nll)
+    return best_t
+
+
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
@@ -84,6 +101,7 @@ def main():
     parser.add_argument("--metric", type=str, default="macro_f1")
     parser.add_argument("--weight_step", type=float, default=0.1,
                          help="Bước nhảy trọng số. Với >=3 model nên dùng 0.1 để tránh quá chậm.")
+    parser.add_argument("--no_temperature_calibration", action="store_true")
     args = parser.parse_args()
 
     n_models = len(args.model_dirs)
@@ -113,6 +131,19 @@ def main():
             return
 
     console.print(f"  Val: {len(ref_val_labels)} samples | Test: {len(ref_test_labels)} samples | labels khớp ✓")
+
+    temperatures = [1.0] * n_models
+    if not args.no_temperature_calibration:
+        temperatures = [
+            fit_temperature(data["val_probs"], ref_val_labels) for data in all_data
+        ]
+        for data, temperature in zip(all_data, temperatures):
+            data["val_probs"] = temperature_scale_probs(data["val_probs"], temperature)
+            data["test_probs"] = temperature_scale_probs(data["test_probs"], temperature)
+        console.print(
+            "  Validation temperatures: "
+            + ", ".join(f"{name}={temp:.2f}" for name, temp in zip(names, temperatures))
+        )
 
     # ── Baseline: từng model riêng lẻ ─────────────────────────────────────────
     individual_metrics = []
@@ -174,6 +205,7 @@ def main():
             "ensemble_metrics": ensemble_metrics,
             "best_weights": dict(zip(names, best_weights)),
             "val_score_at_best_weights": best_score,
+            "temperatures": dict(zip(names, temperatures)),
         }, f, indent=2)
     console.print("\nResults saved to results/ensemble_n_results.json")
 

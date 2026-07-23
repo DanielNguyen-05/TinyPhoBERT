@@ -39,9 +39,9 @@ training:
   early_stopping_patience: 8
 
 data:
-  train_file: data/augmented/train.csv
-  val_file: data/augmented/val.csv
-  test_file: data/augmented/test.csv
+  train_file: data/prepared_teacher_strong/train.csv
+  val_file: data/prepared_teacher_strong/val.csv
+  test_file: data/prepared_teacher_strong/test.csv
   text_col: free_text
   label_col: label_id
   seed: 42

@@ -71,6 +71,7 @@ class PhoBERTTeacher(nn.Module):
         self.supcon_weight = supcon_weight
         self.supcon_temperature = supcon_temperature
         self.classification_head = classification_head
+        self.output_attentions = output_attentions
 
         # Load backbone — override dropout prob để khớp với classifier dropout.
         # Khi dùng SupCon, model dễ overfit hơn (embedding sắc nét, học thuộc
@@ -84,6 +85,11 @@ class PhoBERTTeacher(nn.Module):
             attention_probs_dropout_prob=max(0.0, dropout - 0.1),
         )
         self.backbone = AutoModel.from_pretrained(model_name, config=self.config)
+        # Classification uses hidden states directly; the pretrained RoBERTa
+        # pooler is unused and should not appear as an unoptimized parameter.
+        if getattr(self.backbone, "pooler", None) is not None:
+            for parameter in self.backbone.pooler.parameters():
+                parameter.requires_grad = False
 
         self.dropout = nn.Dropout(dropout)
         if classification_head == "linear":
@@ -143,7 +149,7 @@ class PhoBERTTeacher(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
-            output_attentions=True,
+            output_attentions=self.output_attentions,
         )
 
         if self.multiscale_head is not None:
@@ -245,7 +251,21 @@ class PhoBERTTeacher(nn.Module):
         # Handle both raw state_dict and checkpoint dicts
         if "model_state_dict" in state_dict:
             state_dict = state_dict["model_state_dict"]
-        model.load_state_dict(state_dict, strict=False)
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        critical_missing = [
+            key for key in incompatible.missing_keys
+            if key.startswith(("backbone.", "classifier.", "multiscale_head."))
+        ]
+        critical_unexpected = [
+            key for key in incompatible.unexpected_keys
+            if key.startswith(("backbone.", "classifier.", "multiscale_head."))
+        ]
+        if critical_missing or critical_unexpected:
+            raise RuntimeError(
+                "Checkpoint architecture mismatch. "
+                f"Missing={critical_missing[:10]}, "
+                f"unexpected={critical_unexpected[:10]}"
+            )
         print(f"[Teacher] Loaded checkpoint from: {checkpoint_path}")
         return model
 

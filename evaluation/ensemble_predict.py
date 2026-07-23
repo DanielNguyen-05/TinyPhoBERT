@@ -33,6 +33,24 @@ console = Console()
 LABEL_NAMES = ["CLEAN", "OFFENSIVE", "HATE"]
 
 
+def temperature_scale_probs(probs: np.ndarray, temperature: float) -> np.ndarray:
+    logits = np.log(np.clip(probs, 1e-12, 1.0)) / temperature
+    logits -= logits.max(axis=1, keepdims=True)
+    exp_logits = np.exp(logits)
+    return exp_logits / exp_logits.sum(axis=1, keepdims=True)
+
+
+def fit_temperature(probs: np.ndarray, labels: np.ndarray) -> float:
+    """Select probability temperature on validation NLL only."""
+    best_t, best_nll = 1.0, float("inf")
+    for temperature in np.arange(0.5, 3.01, 0.05):
+        calibrated = temperature_scale_probs(probs, float(temperature))
+        nll = -np.log(np.clip(calibrated[np.arange(len(labels)), labels], 1e-12, 1.0)).mean()
+        if nll < best_nll:
+            best_t, best_nll = float(temperature), float(nll)
+    return best_t
+
+
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
@@ -91,6 +109,7 @@ def main():
                          help="Thư mục chứa val/test probs.npy của model B")
     parser.add_argument("--metric", type=str, default="macro_f1")
     parser.add_argument("--weight_step", type=float, default=0.05)
+    parser.add_argument("--no_temperature_calibration", action="store_true")
     args = parser.parse_args()
 
     console.print("[bold cyan]Loading saved probabilities...[/bold cyan]")
@@ -115,6 +134,17 @@ def main():
     if not np.array_equal(data_a["test_labels"], data_b["test_labels"]):
         console.print("[bold red]✗ Test labels giữa Model A và Model B KHÔNG khớp![/bold red]")
         return
+
+    temperatures = [1.0, 1.0]
+    if not args.no_temperature_calibration:
+        temperatures = [
+            fit_temperature(data_a["val_probs"], data_a["val_labels"]),
+            fit_temperature(data_b["val_probs"], data_b["val_labels"]),
+        ]
+        for data, temperature in zip([data_a, data_b], temperatures):
+            data["val_probs"] = temperature_scale_probs(data["val_probs"], temperature)
+            data["test_probs"] = temperature_scale_probs(data["test_probs"], temperature)
+        console.print(f"  Validation temperatures: A={temperatures[0]:.2f}, B={temperatures[1]:.2f}")
 
     console.print(
         f"  Val: {len(data_a['val_labels'])} samples | "
@@ -180,6 +210,7 @@ def main():
             "best_weight_model_a": float(best_w),
             "best_weight_model_b": float(1 - best_w),
             "val_score_at_best_w": float(best_val_score),
+            "temperatures": temperatures,
         }, f, indent=2)
     console.print("\nResults saved to results/ensemble_results.json")
 

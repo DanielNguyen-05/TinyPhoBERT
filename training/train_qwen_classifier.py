@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -199,7 +200,7 @@ def train(config: dict) -> None:
     optimizer = torch.optim.AdamW(trainable_params, lr=training_cfg["learning_rate"], weight_decay=training_cfg["weight_decay"])
 
     grad_accum = training_cfg.get("gradient_accumulation_steps", 1)
-    num_steps = (len(train_loader) // grad_accum) * training_cfg["num_epochs"]
+    num_steps = math.ceil(len(train_loader) / grad_accum) * training_cfg["num_epochs"]
     num_warmup = int(num_steps * training_cfg["warmup_ratio"])
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup, num_steps)
     console.print(f"  Schedule: Cosine | total_steps={num_steps} | warmup={num_warmup}")

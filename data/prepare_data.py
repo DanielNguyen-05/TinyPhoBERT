@@ -81,6 +81,7 @@ def prepare_data(config: dict, apply_preprocess: bool = True, apply_augment: boo
             "apply_teen": preprocess_cfg.get("apply_teencode", True),
             "remove_emoji": preprocess_cfg.get("remove_emoji", False),
             "remove_phone": preprocess_cfg.get("remove_phone", True),
+            "word_segment": preprocess_cfg.get("word_segment", False),
         }
         print(f"  Settings: {preprocess_kwargs}")
 

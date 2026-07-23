@@ -18,6 +18,7 @@ preprocessing:
   apply_teencode: false
   remove_emoji: false
   remove_phone: true
+  word_segment: true
 
 # Establish an unaugmented baseline first. EDA can alter the class semantics
 # of short hate/offensive comments and must earn its place through validation.

@@ -197,6 +197,26 @@ def apply_teencode(text: str, teencode_dict: dict = None) -> str:
     return " ".join(result)
 
 
+def segment_vietnamese_words(text: str) -> str:
+    """
+    Segment Vietnamese words using underscores, as expected by PhoBERT.
+
+    PhoBERT was pretrained on RDRSegmenter-style word-segmented text. Feeding
+    raw whitespace-separated syllables creates a train/pretraining mismatch.
+    Underthesea is used here because it is straightforward to run in the data
+    preparation stage; segmentation is deliberately optional for models such
+    as ViSoBERT that were pretrained on raw social-media text.
+    """
+    try:
+        from underthesea import word_tokenize
+    except ImportError as exc:
+        raise RuntimeError(
+            "word_segment=true requires `underthesea`; install requirements.txt "
+            "before preparing PhoBERT data."
+        ) from exc
+    return word_tokenize(text, format="text")
+
+
 def preprocess_text(
     text: str,
     lowercase: bool = True,
@@ -206,6 +226,7 @@ def preprocess_text(
     apply_teen: bool = True,
     remove_emoji: bool = False,    # False = giữ emoji (có thể mang sentiment)
     remove_phone: bool = True,
+    word_segment: bool = False,
 ) -> str:
     """
     Pipeline tiền xử lý văn bản tiếng Việt cho hate speech detection.
@@ -267,7 +288,11 @@ def preprocess_text(
     if apply_teen:
         text = apply_teencode(text)
 
-    # 8. Final whitespace cleanup
+    # 8. PhoBERT-compatible Vietnamese word segmentation (optional)
+    if word_segment:
+        text = segment_vietnamese_words(text)
+
+    # 9. Final whitespace cleanup
     text = _MULTI_SPACE_PATTERN.sub(" ", text).strip()
 
     return text

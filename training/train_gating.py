@@ -80,6 +80,11 @@ def main():
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--gate_val_split", type=float, default=0.2,
                          help="Tỷ lệ tách từ VAL set làm holdout cho early stopping của gating.")
+    parser.add_argument(
+        "--export_moe_teacher", action="store_true",
+        help="Also combine in-sample train probabilities for distillation. "
+             "Requires every expert export to use the same canonical train rows.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -88,14 +93,15 @@ def main():
     n_experts = len(args.model_dirs)
     console.print(f"[bold cyan]Loading probabilities từ {n_experts} experts...[/bold cyan]")
 
-    train_probs_leaky, train_labels_leaky = load_split(args.model_dirs, "train")
     val_probs_full, val_labels_full = load_split(args.model_dirs, "val")
     test_probs, test_labels = load_split(args.model_dirs, "test")
 
-    console.print(
-        f"  train (LEAKY — chỉ dùng để sinh soft-label distillation sau này, "
-        f"KHÔNG dùng để train gating): {train_probs_leaky.shape}"
-    )
+    train_probs_leaky = train_labels_leaky = None
+    if args.export_moe_teacher:
+        train_probs_leaky, train_labels_leaky = load_split(args.model_dirs, "train")
+        console.print(
+            f"  train (in-sample; distillation export only): {train_probs_leaky.shape}"
+        )
     console.print(f"  val (dùng để TRAIN gating — expert chưa từng thấy): {val_probs_full.shape}")
     console.print(f"  test: {test_probs.shape}")
 
@@ -266,23 +272,25 @@ def main():
     # dùng để TRAIN gating network ở trên) — nếu không, moe_teacher_probs sẽ
     # có kích thước sai, gây lệch với data/augmented/train.csv thật khi
     # train_moe_distill.py load lại.
-    moe_dir = os.path.join(args.output_dir, "moe_teacher_probs")
-    os.makedirs(moe_dir, exist_ok=True)
-    with torch.no_grad():
-        for split, probs_arr, labels_arr in [
-            ("train", train_probs_leaky, train_labels_leaky),
-            ("val", val_probs_full, val_labels_full),
-            ("test", test_probs, test_labels),
-        ]:
-            probs_t = torch.tensor(probs_arr, dtype=torch.float32).to(device)
-            out = model(probs_t)
-            final_probs = out["final_probs"].cpu().numpy()
-            np.save(os.path.join(moe_dir, f"{split}_probs.npy"), final_probs)
-            np.save(os.path.join(moe_dir, f"{split}_labels.npy"), labels_arr)
-    console.print(
-        f"MoE teacher probs (train={len(train_labels_leaky)}, val={len(val_labels_full)}, "
-        f"test={len(test_labels)}) saved to {moe_dir}/ — dùng cho multi-teacher distillation"
-    )
+    if args.export_moe_teacher:
+        moe_dir = os.path.join(args.output_dir, "moe_teacher_probs")
+        os.makedirs(moe_dir, exist_ok=True)
+        with torch.no_grad():
+            for split, probs_arr, labels_arr in [
+                ("train", train_probs_leaky, train_labels_leaky),
+                ("val", val_probs_full, val_labels_full),
+                ("test", test_probs, test_labels),
+            ]:
+                probs_t = torch.tensor(probs_arr, dtype=torch.float32).to(device)
+                out = model(probs_t)
+                final_probs = out["final_probs"].cpu().numpy()
+                np.save(os.path.join(moe_dir, f"{split}_probs.npy"), final_probs)
+                np.save(os.path.join(moe_dir, f"{split}_labels.npy"), labels_arr)
+        console.print(
+            f"MoE teacher probs (train={len(train_labels_leaky)}, "
+            f"val={len(val_labels_full)}, test={len(test_labels)}) "
+            f"saved to {moe_dir}/"
+        )
 
 
 if __name__ == "__main__":

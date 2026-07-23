@@ -281,6 +281,7 @@ def train(config: dict) -> None:
     # ── Model — KHÔNG có SupCon ───────────────────────────────────────────────
     console.print(f"\n[bold cyan]Building Teacher model ({config['model']['name']})...[/bold cyan]")
     use_focal = config["training"].get("use_focal_loss", True)
+    use_class_weights = config["training"].get("use_class_weights", use_focal)
     focal_gamma = config["training"].get("focal_gamma", 2.0)
     label_smoothing = config["training"].get("label_smoothing", 0.1)
 
@@ -288,14 +289,23 @@ def train(config: dict) -> None:
         model_name=config["model"]["name"],
         num_labels=config["model"]["num_labels"],
         dropout=config["model"]["dropout"],
-        class_weights=class_weights if use_focal else None,
+        class_weights=class_weights if use_class_weights else None,
         use_focal_loss=use_focal,
         focal_gamma=focal_gamma,
         label_smoothing=label_smoothing,
+        classification_head=config["model"].get("classification_head", "linear"),
+        num_mixed_layers=config["model"].get("num_mixed_layers", 4),
+        cnn_kernel_sizes=tuple(config["model"].get("cnn_kernel_sizes", [1, 3, 5])),
+        cnn_channels=config["model"].get("cnn_channels", 128),
+        output_attentions=False,
     ).to(device)
 
     console.print(f"  Teacher params: [bold green]{model.count_parameters():,}[/bold green]")
-    console.print(f"  Loss: {'Focal Loss' if use_focal else 'Weighted CE'} | γ={focal_gamma}")
+    console.print(
+        f"  Head: {config['model'].get('classification_head', 'linear')} | "
+        f"Loss: {'Focal' if use_focal else 'Cross-entropy'} | "
+        f"class_weights={use_class_weights} | γ={focal_gamma}"
+    )
 
     # ── FGM Adversarial Training (tùy chọn) ───────────────────────────────────
     use_fgm = config["training"].get("use_fgm", False)
@@ -337,20 +347,39 @@ def train(config: dict) -> None:
                                        if any(nd in n for nd in no_decay)],
                             "weight_decay": 0.0, "lr": layer_lr})
 
-        groups.append({"params": [p for n, p in model.classifier.named_parameters()
+        backbone_ids = {id(p) for p in model.backbone.parameters()}
+        head_named_params = [
+            (n, p) for n, p in model.named_parameters()
+            if id(p) not in backbone_ids and p.requires_grad
+        ]
+        head_lr = base_lr * config["training"].get("head_lr_multiplier", 5.0)
+        groups.append({"params": [p for n, p in head_named_params
                                    if not any(nd in n for nd in no_decay)],
-                        "weight_decay": config["training"]["weight_decay"], "lr": base_lr})
-        groups.append({"params": [p for n, p in model.classifier.named_parameters()
+                        "weight_decay": config["training"]["weight_decay"], "lr": head_lr})
+        groups.append({"params": [p for n, p in head_named_params
                                    if any(nd in n for nd in no_decay)],
-                        "weight_decay": 0.0, "lr": base_lr})
+                        "weight_decay": 0.0, "lr": head_lr})
 
         optimizer = torch.optim.AdamW(groups)
-        console.print(f"  [yellow]LLRD enabled: factor={llrd_factor}[/yellow]")
+        console.print(
+            f"  [yellow]LLRD enabled: factor={llrd_factor}, head_lr={head_lr:.2e}[/yellow]"
+        )
     else:
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config["training"]["learning_rate"],
             weight_decay=config["training"]["weight_decay"],
+        )
+
+    optimized_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+    missing_trainable = [
+        name for name, p in model.named_parameters()
+        if p.requires_grad and id(p) not in optimized_ids
+    ]
+    if missing_trainable:
+        raise RuntimeError(
+            "Optimizer is missing trainable parameters: "
+            + ", ".join(missing_trainable[:20])
         )
 
     num_training_steps = len(train_loader) * config["training"]["num_epochs"]
@@ -456,7 +485,9 @@ def train(config: dict) -> None:
     with open(os.path.join(results_dir, "teacher_results.json"), "w") as f:
         json.dump({
             **test_metrics, "best_epoch": best_epoch, "model_name": config["model"]["name"],
-            "augmentation": True, "preprocessing": True,
+            "augmentation": config.get("augmentation", {}).get("enabled", False),
+            "preprocessing": config.get("preprocessing", {}).get("enabled", False),
+            "classification_head": config["model"].get("classification_head", "linear"),
         }, f, indent=2)
     console.print(f"Results saved to {results_dir}/teacher_results.json")
 
