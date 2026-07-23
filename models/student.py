@@ -1,108 +1,19 @@
 """
 models/student.py
 
-TinyPhoBERT Student Model — Compact Vietnamese Hate Speech Classifier.
-
-Architecture:
-    6 Transformer Layers (vs 12 in PhoBERT)
-    384 Hidden Size    (vs 768 in PhoBERT)
-    6 Attention Heads  (vs 12 in PhoBERT)
-    ~35-45M parameters
-
-The student uses the same BPE tokenizer as PhoBERT (vinai/phobert-base),
-ensuring identical tokenization between teacher and student.
-
-A linear projection layer (384 → 768) is added to align student hidden
-states with teacher hidden states during distillation.
+TinyPhoBERT — Compact Student Model cho Multi-Teacher Distillation.
+6 layers / 384 hidden / 6 heads — nhỏ hơn nhiều so với các expert teacher.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import RobertaConfig, RobertaModel
 
 
-class MultiScaleHateSpeechHead(nn.Module):
-    """Mix upper layers and capture both global context and local n-grams."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_labels: int,
-        num_mixed_layers: int = 4,
-        cnn_kernel_sizes: Tuple[int, ...] = (1, 3, 5),
-        cnn_channels: int = 128,
-        dropout: float = 0.2,
-    ) -> None:
-        super().__init__()
-        if num_mixed_layers < 1:
-            raise ValueError("num_mixed_layers must be positive")
-        if not cnn_kernel_sizes or any(k < 1 or k % 2 == 0 for k in cnn_kernel_sizes):
-            raise ValueError("cnn_kernel_sizes must contain positive odd integers")
-
-        self.num_mixed_layers = num_mixed_layers
-        self.layer_weights = nn.Parameter(torch.zeros(num_mixed_layers))
-        self.convs = nn.ModuleList([
-            nn.Conv1d(hidden_size, cnn_channels, kernel_size=k, padding=k // 2)
-            for k in cnn_kernel_sizes
-        ])
-
-        combined_size = 2 * hidden_size + len(cnn_kernel_sizes) * cnn_channels
-        self.projection = nn.Linear(combined_size, hidden_size)
-        self.gate = nn.Linear(2 * hidden_size, hidden_size)
-        self.norm = nn.LayerNorm(hidden_size)
-        self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(hidden_size, num_labels)
-
-    def forward(
-        self,
-        hidden_states: Tuple[torch.Tensor, ...],
-        attention_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        available = min(self.num_mixed_layers, len(hidden_states))
-        selected = hidden_states[-available:]
-        weights = torch.softmax(self.layer_weights[-available:], dim=0)
-        sequence = sum(w * h for w, h in zip(weights, selected))
-
-        mask = attention_mask.unsqueeze(-1).to(sequence.dtype)
-        mean_pool = (sequence * mask).sum(1) / mask.sum(1).clamp(min=1.0)
-        cls_pool = sequence[:, 0]
-
-        conv_input = sequence.transpose(1, 2)
-        padding_mask = attention_mask.unsqueeze(1).bool()
-        conv_pools = []
-        for conv in self.convs:
-            features = torch.relu(conv(conv_input))
-            features = features.masked_fill(~padding_mask, torch.finfo(features.dtype).min)
-            conv_pools.append(features.max(dim=2).values)
-
-        local_global = torch.cat([cls_pool, mean_pool, *conv_pools], dim=-1)
-        candidate = torch.nn.functional.gelu(self.projection(local_global))
-        gate = torch.sigmoid(self.gate(torch.cat([cls_pool, candidate], dim=-1)))
-        pooled = self.norm(cls_pool + gate * candidate)
-        pooled = self.dropout(pooled)
-        return self.classifier(pooled), pooled
-
-
 class TinyPhoBERT(nn.Module):
-    """
-    TinyPhoBERT: Compact student model for Vietnamese Hate Speech Detection.
-
-    Args:
-        vocab_size: Vocabulary size (matches PhoBERT: 64001).
-        num_hidden_layers: Number of Transformer layers (default: 6).
-        hidden_size: Hidden dimension size (default: 384).
-        num_attention_heads: Number of attention heads (default: 6).
-        intermediate_size: FFN intermediate size (default: 1536 = 4 × 384).
-        max_position_embeddings: Max sequence length (default: 258, same as PhoBERT).
-        num_labels: Number of output classes (default: 3).
-        hidden_dropout_prob: Dropout on hidden states.
-        attention_probs_dropout_prob: Dropout on attention weights.
-        classifier_dropout: Dropout before classifier head.
-        teacher_hidden_size: Teacher's hidden size for projection (default: 768).
-    """
-
     def __init__(
         self,
         vocab_size: int = 64001,
@@ -115,25 +26,14 @@ class TinyPhoBERT(nn.Module):
         hidden_dropout_prob: float = 0.1,
         attention_probs_dropout_prob: float = 0.1,
         classifier_dropout: float = 0.1,
-        teacher_hidden_size: int = 1024,
         layer_norm_eps: float = 1e-5,
         type_vocab_size: int = 1,
-        classification_head: str = "linear",
-        num_mixed_layers: int = 4,
-        cnn_kernel_sizes: Tuple[int, ...] = (1, 3, 5),
-        cnn_channels: int = 128,
     ) -> None:
         super().__init__()
         self.num_labels = num_labels
         self.hidden_size = hidden_size
         self.num_layers = num_hidden_layers
-        self.num_heads = num_attention_heads
-        self.teacher_hidden_size = teacher_hidden_size
-        self.classification_head = classification_head
 
-        # Build RoBERTa config (PhoBERT uses RoBERTa architecture)
-        # NOTE: attn_implementation="eager" is required for output_attentions=True
-        # in newer transformers versions that default to SDPA attention.
         self.config = RobertaConfig(
             vocab_size=vocab_size,
             num_hidden_layers=num_hidden_layers,
@@ -145,268 +45,38 @@ class TinyPhoBERT(nn.Module):
             attention_probs_dropout_prob=attention_probs_dropout_prob,
             layer_norm_eps=layer_norm_eps,
             type_vocab_size=type_vocab_size,
-            output_hidden_states=True,
-            output_attentions=True,
         )
-
-        # Main transformer backbone
-        self.config._attn_implementation = "eager"
         self.backbone = RobertaModel(self.config, add_pooling_layer=False)
-
-        # Classifier head. The multi-scale option is the comparison model:
-        # upper-layer mixing + local CNN features + gated global pooling.
         self.dropout = nn.Dropout(classifier_dropout)
-        if classification_head == "linear":
-            self.classifier = nn.Linear(hidden_size, num_labels)
-            self.multiscale_head = None
-        elif classification_head == "multiscale":
-            self.classifier = None
-            self.multiscale_head = MultiScaleHateSpeechHead(
-                hidden_size=hidden_size,
-                num_labels=num_labels,
-                num_mixed_layers=num_mixed_layers,
-                cnn_kernel_sizes=tuple(cnn_kernel_sizes),
-                cnn_channels=cnn_channels,
-                dropout=classifier_dropout,
-            )
-        else:
-            raise ValueError("classification_head must be 'linear' or 'multiscale'")
+        self.classifier = nn.Linear(hidden_size, num_labels)
 
-        # Projection layer: align student hidden states → teacher hidden size
-        # Used ONLY during distillation, not inference
-        # teacher_hidden_size = 768 (base) | 1024 (large)
-        self.hidden_projection = nn.Linear(hidden_size, teacher_hidden_size, bias=False)
-
-        # Initialize weights
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        """Initialize classifier and projection with small normal weights."""
-        if self.classifier is not None:
-            nn.init.normal_(self.classifier.weight, std=0.02)
-            nn.init.zeros_(self.classifier.bias)
-        nn.init.normal_(self.hidden_projection.weight, std=0.02)
-
-    def init_from_teacher(
-        self,
-        teacher_model,
-        layer_mapping: Optional[dict] = None,
-    ) -> None:
-        """
-        Khởi tạo student từ weights của teacher bằng kỹ thuật weight slicing.
-
-        Hỗ trợ cả PhoBERT-base (12L/768H) và PhoBERT-large (24L/1024H).
-
-        Layer mapping mặc định:
-          Base  (12L): Student [0..5] ← Teacher [0,2,4,6,8,10]  (bước 2)
-          Large (24L): Student [0..5] ← Teacher [0,4,8,12,16,20] (bước 4)
-
-        Args:
-            teacher_model: PhoBERTTeacher instance.
-            layer_mapping: Dict {student_idx: teacher_idx}. Tự động nếu None.
-        """
-        teacher_backbone = (
-            teacher_model.backbone
-            if hasattr(teacher_model, "backbone")
-            else teacher_model
-        )
-        t_num_layers = teacher_model.num_layers if hasattr(teacher_model, "num_layers") else 12
-        d_t = teacher_model.hidden_size if hasattr(teacher_model, "hidden_size") else 768
-        d_s = self.hidden_size  # 384
-
-        # Auto layer mapping: distribute evenly across teacher layers
-        if layer_mapping is None:
-            step = t_num_layers // self.num_layers  # 2 for base-12, 4 for large-24
-            layer_mapping = {i: i * step for i in range(self.num_layers)}
-
-        print(f"[InitFromTeacher] Teacher: {t_num_layers}L/{d_t}H | Student: {self.num_layers}L/{d_s}H")
-        print(f"[InitFromTeacher] Layer mapping: {layer_mapping}")
-
-        student_backbone = self.backbone
-        n_copied = 0
-        n_skipped = 0
-
-        # ── 1. Copy Embeddings (slice hidden dim) ──────────────────────────────
-        t_emb = teacher_backbone.embeddings
-        s_emb = student_backbone.embeddings
-
-        with torch.no_grad():
-            s_emb.word_embeddings.weight.copy_(
-                t_emb.word_embeddings.weight[:, :d_s]
-            )
-            if hasattr(t_emb, "position_embeddings") and hasattr(s_emb, "position_embeddings"):
-                s_emb.position_embeddings.weight.copy_(
-                    t_emb.position_embeddings.weight[:, :d_s]
-                )
-            if hasattr(t_emb, "LayerNorm") and hasattr(s_emb, "LayerNorm"):
-                s_emb.LayerNorm.weight.copy_(t_emb.LayerNorm.weight[:d_s])
-                s_emb.LayerNorm.bias.copy_(t_emb.LayerNorm.bias[:d_s])
-
-        print(f"[InitFromTeacher] Embeddings: sliced {d_t}→{d_s}")
-
-        # ── 2. Copy Transformer Layers ──────────────────────────────────────────
-        t_layers = teacher_backbone.encoder.layer
-        s_layers = student_backbone.encoder.layer
-        i_s = self.backbone.config.intermediate_size  # 1536
-        i_t = teacher_backbone.config.intermediate_size  # 3072 (base) | 4096 (large)
-
-        for s_idx, t_idx in layer_mapping.items():
-            if s_idx >= len(s_layers) or t_idx >= len(t_layers):
-                print(f"  [Skip] S[{s_idx}] ← T[{t_idx}]: out of range")
-                n_skipped += 1
-                continue
-
-            t_layer = t_layers[t_idx]
-            s_layer = s_layers[s_idx]
-
-            with torch.no_grad():
-                # Attention Q, K, V
-                for attn_name in ["query", "key", "value"]:
-                    t_W = getattr(t_layer.attention.self, attn_name)
-                    s_W = getattr(s_layer.attention.self, attn_name)
-                    s_W.weight.copy_(t_W.weight[:d_s, :d_s])
-                    s_W.bias.copy_(t_W.bias[:d_s])
-
-                # Attention output projection
-                s_layer.attention.output.dense.weight.copy_(
-                    t_layer.attention.output.dense.weight[:d_s, :d_s]
-                )
-                s_layer.attention.output.dense.bias.copy_(
-                    t_layer.attention.output.dense.bias[:d_s]
-                )
-                s_layer.attention.output.LayerNorm.weight.copy_(
-                    t_layer.attention.output.LayerNorm.weight[:d_s]
-                )
-                s_layer.attention.output.LayerNorm.bias.copy_(
-                    t_layer.attention.output.LayerNorm.bias[:d_s]
-                )
-
-                # FFN
-                s_layer.intermediate.dense.weight.copy_(
-                    t_layer.intermediate.dense.weight[:i_s, :d_s]
-                )
-                s_layer.intermediate.dense.bias.copy_(
-                    t_layer.intermediate.dense.bias[:i_s]
-                )
-                s_layer.output.dense.weight.copy_(
-                    t_layer.output.dense.weight[:d_s, :i_s]
-                )
-                s_layer.output.dense.bias.copy_(
-                    t_layer.output.dense.bias[:d_s]
-                )
-                s_layer.output.LayerNorm.weight.copy_(
-                    t_layer.output.LayerNorm.weight[:d_s]
-                )
-                s_layer.output.LayerNorm.bias.copy_(
-                    t_layer.output.LayerNorm.bias[:d_s]
-                )
-
-                n_copied += 1
-            print(f"  S[{s_idx}] ← T[{t_idx}]: ✓")
-
-        print(f"[InitFromTeacher] Done: {n_copied} layers copied, {n_skipped} skipped.")
+        nn.init.normal_(self.classifier.weight, std=0.02)
+        nn.init.zeros_(self.classifier.bias)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
-        return_distill_outputs: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass.
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        cls_output = outputs.last_hidden_state[:, 0, :]
+        cls_output = self.dropout(cls_output)
+        logits = self.classifier(cls_output)
 
-        Args:
-            input_ids: (B, T) token IDs.
-            attention_mask: (B, T) attention mask.
-            labels: (B,) integer class labels (optional).
-            return_distill_outputs: If True, return hidden states and attentions
-                                    for knowledge distillation.
-
-        Returns:
-            Dictionary with:
-                logits          : (B, num_labels)
-                loss            : scalar CE loss (if labels provided)
-                pooled_output   : (B, 384) CLS representation
-                hidden_states   : tuple of (B, T, 384) per layer [if distill]
-                projected_hidden: tuple of (B, T, 768) projected [if distill]
-                attentions      : tuple of (B, 6, T, T) per layer [if distill]
-        """
-        outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=return_distill_outputs or self.multiscale_head is not None,
-            output_attentions=return_distill_outputs,
-        )
-
-        sequence_output = outputs.last_hidden_state
-        if self.multiscale_head is not None:
-            logits, cls_output = self.multiscale_head(
-                outputs.hidden_states, attention_mask
-            )
-        else:
-            cls_output = self.dropout(sequence_output[:, 0, :])
-            logits = self.classifier(cls_output)
-
-        result = {
-            "logits": logits,
-            "pooled_output": cls_output,
-        }
-
+        result = {"logits": logits}
         if labels is not None:
-            loss_fn = nn.CrossEntropyLoss()
-            result["loss"] = loss_fn(logits, labels)
-
-        if return_distill_outputs:
-            result["hidden_states"] = outputs.hidden_states   # (num_layers+1,)
-            result["attentions"] = outputs.attentions          # (num_layers,)
-
-            # Project all hidden states for alignment with teacher
-            projected = tuple(
-                self.hidden_projection(h) for h in outputs.hidden_states
-            )
-            result["projected_hidden"] = projected
-
+            result["loss"] = F.cross_entropy(logits, labels)
         return result
 
-    def count_parameters(self, trainable_only: bool = True) -> int:
-        """Count model parameters."""
-        if trainable_only:
-            return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
-
-    def model_size_mb(self) -> float:
-        """Return approximate model size in MB."""
-        param_size = sum(p.numel() * p.element_size() for p in self.parameters())
-        buffer_size = sum(b.numel() * b.element_size() for b in self.buffers())
-        return (param_size + buffer_size) / (1024 ** 2)
-
-    def print_summary(self) -> None:
-        """Print model architecture summary."""
-        total = self.count_parameters(trainable_only=False)
-        trainable = self.count_parameters(trainable_only=True)
-        size_mb = self.model_size_mb()
-        print("=" * 55)
-        print("TinyPhoBERT Model Summary")
-        print("=" * 55)
-        print(f"  Transformer Layers  : {self.num_layers}")
-        print(f"  Hidden Size         : {self.hidden_size}")
-        print(f"  Attention Heads     : {self.num_heads}")
-        print(f"  Total Parameters    : {total:,}")
-        print(f"  Trainable Params    : {trainable:,}")
-        print(f"  Model Size          : {size_mb:.1f} MB")
-        print("=" * 55)
 
 
 def build_student_from_config(config: dict) -> TinyPhoBERT:
     """
-    Build TinyPhoBERT from a config dictionary (loaded from YAML).
-
-    Args:
-        config: Dict with keys matching TinyPhoBERT.__init__ arguments.
-
-    Returns:
-        Initialized TinyPhoBERT model.
+    Build TinyPhoBERT từ config dict — giữ lại để tương thích với
+    models/__init__.py (import build_student_from_config) từ code cũ.
     """
     model_cfg = config.get("model", config)
     return TinyPhoBERT(
@@ -420,10 +90,5 @@ def build_student_from_config(config: dict) -> TinyPhoBERT:
         hidden_dropout_prob=model_cfg.get("hidden_dropout_prob", 0.1),
         attention_probs_dropout_prob=model_cfg.get("attention_probs_dropout_prob", 0.1),
         classifier_dropout=model_cfg.get("classifier_dropout", 0.1),
-        teacher_hidden_size=model_cfg.get("teacher_hidden_size", 1024),
         layer_norm_eps=model_cfg.get("layer_norm_eps", 1e-5),
-        classification_head=model_cfg.get("classification_head", "linear"),
-        num_mixed_layers=model_cfg.get("num_mixed_layers", 4),
-        cnn_kernel_sizes=tuple(model_cfg.get("cnn_kernel_sizes", [1, 3, 5])),
-        cnn_channels=model_cfg.get("cnn_channels", 128),
     )

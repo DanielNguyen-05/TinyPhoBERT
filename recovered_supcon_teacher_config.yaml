@@ -1,0 +1,65 @@
+model:
+  name: vinai/phobert-large
+  num_labels: 3
+  dropout: 0.3
+  classifier_dropout: 0.2
+preprocessing:
+  enabled: true
+  lowercase: true
+  remove_url: true
+  normalize_unicode: true
+  reduce_repeat: true
+  apply_teencode: true
+  remove_emoji: false
+  remove_phone: true
+augmentation:
+  enabled: true
+  target_classes:
+  - 1
+  - 2
+  augment_ratio: 0.5
+  num_aug_per_sample: 3
+  alpha_sr: 0.1
+  alpha_ri: 0.1
+  alpha_rs: 0.1
+  p_rd: 0.1
+training:
+  output_dir: checkpoints/teacher_large
+  num_epochs: 50
+  batch_size: 32
+  max_seq_length: 128
+  learning_rate: 2.0e-05
+  weight_decay: 0.1
+  warmup_ratio: 0.1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  fp16: false
+  dataloader_num_workers: 4
+  early_stopping_patience: 8
+  use_cosine_schedule: true
+  use_focal_loss: true
+  focal_gamma: 2.0
+  label_smoothing: 0.1
+  use_weighted_sampler: true
+  sampler_strength: 0.5
+  use_supcon: true
+  supcon_proj_dim: 256
+  supcon_weight: 0.1
+  supcon_temperature: 0.07
+  use_llrd: true
+  llrd_factor: 0.9
+data:
+  train_file: data/processed/train.csv
+  val_file: data/processed/val.csv
+  test_file: data/processed/test.csv
+  augmented_dir: data/augmented
+  text_col: free_text
+  label_col: label_id
+  seed: 42
+logging:
+  use_wandb: false
+  use_tensorboard: true
+  project_name: TinyPhoBERT
+  run_name: teacher-phobert-large-augmented
+  log_dir: logs/teacher
+_config_path: configs/recovered_supcon_teacher_config.yaml

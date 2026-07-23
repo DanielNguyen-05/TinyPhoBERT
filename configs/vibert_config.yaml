@@ -1,9 +1,10 @@
-# PhoBERT_v2 + FGM Configuration — augmentation TẮT (ablation)
-# ViSoBERT-noaug tăng +1.8 điểm khi tắt EDA augmentation (63.82%→65.62%).
-# Test xem PhoBERT_v2+FGM có hưởng lợi tương tự không.
+# viBERT Configuration — model thứ 4 để thử ensemble
+# viBERT (FPTAI): pretrain 10GB text tiếng Việt, kiến trúc giống mBERT
+# nhưng loại bỏ vocab không cần thiết. Domain khác PhoBERT/ViSoBERT/Qwen
+# — có thể mang thêm sai số bổ trợ cho ensemble.
 
 model:
-  name: "vinai/phobert-base-v2"
+  name: "FPTAI/vibert-base-cased"
   num_labels: 3
   dropout: 0.1
   classifier_dropout: 0.1
@@ -19,7 +20,7 @@ preprocessing:
   remove_phone: true
 
 augmentation:
-  enabled: false                 # ← TẮT, giống thử nghiệm thành công với ViSoBERT
+  enabled: false                 # Theo bài học từ ViSoBERT — thử tắt trước
   target_classes: [1, 2]
   augment_ratio: 0.5
   num_aug_per_sample: 3
@@ -29,7 +30,7 @@ augmentation:
   p_rd: 0.1
 
 training:
-  output_dir: "checkpoints/phobert_v2_fgm_noaug"
+  output_dir: "checkpoints/vibert_noaug"
   num_epochs: 30
   batch_size: 32
   max_seq_length: 128
@@ -53,9 +54,8 @@ training:
   use_llrd: true
   llrd_factor: 0.9
 
-  # ── FGM Adversarial Training ──────────────────────────────────────────────
-  use_fgm: true
-  fgm_epsilon: 1.0
+  # FGM cũng có thể thử thêm nếu muốn (đã giúp PhoBERT_v2)
+  use_fgm: false
 
 data:
   train_file: "data/processed/train.csv"
@@ -70,5 +70,5 @@ logging:
   use_wandb: false
   use_tensorboard: true
   project_name: "TinyPhoBERT"
-  run_name: "phobert-v2-fgm-noaug-hsd"
-  log_dir: "logs/phobert_v2_fgm_noaug"
+  run_name: "vibert-noaug-hsd"
+  log_dir: "logs/vibert_noaug"
